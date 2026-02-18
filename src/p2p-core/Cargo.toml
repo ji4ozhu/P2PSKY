@@ -1,0 +1,23 @@
+[package]
+name = "p2p-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+kcp = { workspace = true }
+socket2 = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+parking_lot = { workspace = true }
+futures-util = { workspace = true }
+uuid = { workspace = true }
+reed-solomon-erasure = { workspace = true }
+chacha20poly1305 = { workspace = true }
+portable-atomic = { workspace = true }
+p2p-stun = { path = "../p2p-stun" }
+p2p-turn = { path = "../p2p-turn" }
+p2p-signaling-client = { path = "../p2p-signaling-client" }
+p2p-signaling-proto = { path = "../p2p-signaling-proto" }

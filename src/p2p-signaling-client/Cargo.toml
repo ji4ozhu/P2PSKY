@@ -1,0 +1,13 @@
+[package]
+name = "p2p-signaling-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+p2p-signaling-proto = { path = "../p2p-signaling-proto" }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+futures-util = { workspace = true }

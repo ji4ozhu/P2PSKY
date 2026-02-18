@@ -1,0 +1,14 @@
+[package]
+name = "p2p-stun"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+socket2 = { workspace = true }
+stun-rs = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+parking_lot = { workspace = true }
