@@ -13,13 +13,14 @@
  *   p2p_demo.exe <my_peer_id>
  *
  * Commands (after registration):
- *   connect <peer_id>          - Connect to a remote peer
+ *   connect <peer_id> [timeout_ms] [turn_only] - Connect to a remote peer
  *   send <peer_id> <message>   - Send a text message
  *   file <peer_id> <path>      - Send a file
  *   stats <peer_id>            - Show connection statistics
  *   fec <peer_id> on|off       - Toggle FEC
  *   encrypt <peer_id> on|off   - Toggle encryption
  *   dns <peer_id> on|off       - Toggle DNS disguise
+ *   retry <peer_id> on|off     - Toggle P2P retry while relayed
  *   help                       - Show commands
  *   quit                       - Exit
  */
@@ -668,7 +669,9 @@ static void print_stats(const char* peer_id) {
 static void print_help() {
     set_color(Color::Cyan);
     printf("\nCommands:\n");
-    printf("  connect <peer_id>          Connect to a remote peer\n");
+    printf("  connect <peer_id> [timeout_ms] [turn]  Connect to a remote peer\n");
+    printf("          timeout_ms: punch timeout (0=default 15s)\n");
+    printf("          turn: skip punching, go straight to TURN\n");
     printf("  send <peer_id> <message>   Send a text message\n");
     printf("  file <peer_id> <path>      Send a file\n");
     printf("  stats <peer_id>            Show connection statistics\n");
@@ -676,6 +679,9 @@ static void print_help() {
     printf("  fec <peer_id> on|off       Toggle FEC\n");
     printf("  encrypt <peer_id> on|off   Toggle encryption\n");
     printf("  dns <peer_id> on|off       Toggle DNS disguise\n");
+    printf("  retry <peer_id> on|off     Toggle P2P retry while relayed\n");
+    printf("  turn <server> <user> <pass> Set TURN server\n");
+    printf("  turn off                    Disable TURN\n");
     printf("  disconnect <peer_id>       Disconnect from peer\n");
     printf("  help                       Show this help\n");
     printf("  quit                       Exit\n\n");
@@ -715,9 +721,6 @@ int main(int argc, char* argv[]) {
     P2pConfigC config{};
     config.signaling_url = "ws://www.54nb.com:8899";
     config.stun_server   = nullptr;  // use defaults
-    config.turn_server   = nullptr;
-    config.turn_username = nullptr;
-    config.turn_password = nullptr;
     config.enable_ipv6   = true;
     config.kcp_mode      = 1;        // Fast mode
 
@@ -802,17 +805,49 @@ int main(int argc, char* argv[]) {
         // ---- connect ----
         else if (cmd == "connect" || cmd == "c") {
             if (arg1.empty()) {
-                log_warn("Usage: connect <peer_id>");
+                log_warn("Usage: connect <peer_id> [timeout_ms] [turn_only]");
+                log_warn("  timeout_ms: punch timeout in ms (0 = default 15s)");
+                log_warn("  turn_only:  'turn' to skip punching, go straight to TURN");
                 continue;
             }
-            log_info("Connecting to [%s] ...", arg1.c_str());
+            // Parse optional timeout_ms and turn_only from arg2
+            uint32_t timeout_ms = 0;
+            bool turn_only = false;
+            if (!arg2.empty()) {
+                // arg2 may be: "2000", "turn", "2000 turn", etc.
+                std::string timeout_str, rest;
+                size_t sp = arg2.find(' ');
+                if (sp != std::string::npos) {
+                    timeout_str = arg2.substr(0, sp);
+                    rest = arg2.substr(sp + 1);
+                } else {
+                    timeout_str = arg2;
+                }
+                // Check if first token is a number or "turn"
+                if (timeout_str == "turn") {
+                    turn_only = true;
+                } else {
+                    try { timeout_ms = (uint32_t)std::stoul(timeout_str); }
+                    catch (...) { /* ignore parse error, use default */ }
+                }
+                if (rest == "turn") {
+                    turn_only = true;
+                }
+            }
+            if (turn_only) {
+                log_info("Connecting to [%s] (turn_only, skip punch) ...", arg1.c_str());
+            } else if (timeout_ms > 0) {
+                log_info("Connecting to [%s] (punch timeout: %u ms) ...", arg1.c_str(), timeout_ms);
+            } else {
+                log_info("Connecting to [%s] ...", arg1.c_str());
+            }
             {
                 std::lock_guard<std::mutex> lk(g_timing_mutex);
                 auto& t = g_timing_map[arg1];
                 t.start = SteadyClock::now();
                 t.timed = false;
             }
-            err = p2p_connect(g_handle, arg1.c_str());
+            err = p2p_connect(g_handle, arg1.c_str(), timeout_ms, turn_only);
             if (err != P2pErrorCode::Ok) {
                 log_err("p2p_connect failed: %s", p2p_error_string(err));
             }
@@ -924,6 +959,50 @@ int main(int argc, char* argv[]) {
                 log_err("p2p_enable_dns_disguise failed: %s", p2p_error_string(err));
             else
                 log_ok("DNS disguise %s for [%s]", enable ? "enabled" : "disabled", arg1.c_str());
+        }
+        // ---- retry (P2P retry while relayed) ----
+        else if (cmd == "retry") {
+            if (arg1.empty() || arg2.empty()) {
+                log_warn("Usage: retry <peer_id> on|off");
+                continue;
+            }
+            bool enable = (arg2 == "on" || arg2 == "1" || arg2 == "true");
+            err = p2p_enable_p2p_retry(g_handle, arg1.c_str(), enable);
+            if (err != P2pErrorCode::Ok)
+                log_err("p2p_enable_p2p_retry failed: %s", p2p_error_string(err));
+            else
+                log_ok("P2P retry %s for [%s]", enable ? "enabled" : "disabled", arg1.c_str());
+        }
+        // ---- turn ----
+        else if (cmd == "turn") {
+            if (arg1 == "off" || arg1 == "none" || arg1 == "disable") {
+                err = p2p_set_turn_server(g_handle, nullptr, nullptr, nullptr);
+                if (err != P2pErrorCode::Ok)
+                    log_err("p2p_set_turn_server(off) failed: %s", p2p_error_string(err));
+                else
+                    log_ok("TURN disabled");
+            } else if (!arg1.empty()) {
+                // Usage: turn <server:port> <username> <password>
+                std::string user, pass;
+                size_t sp = arg2.find(' ');
+                if (sp != std::string::npos) {
+                    user = arg2.substr(0, sp);
+                    pass = arg2.substr(sp + 1);
+                }
+                if (user.empty() || pass.empty()) {
+                    log_warn("Usage: turn <server:port> <username> <password>");
+                    log_warn("       turn off");
+                } else {
+                    err = p2p_set_turn_server(g_handle, arg1.c_str(), user.c_str(), pass.c_str());
+                    if (err != P2pErrorCode::Ok)
+                        log_err("p2p_set_turn_server failed: %s", p2p_error_string(err));
+                    else
+                        log_ok("TURN set to %s", arg1.c_str());
+                }
+            } else {
+                log_warn("Usage: turn <server:port> <username> <password>");
+                log_warn("       turn off");
+            }
         }
         // ---- disconnect ----
         else if (cmd == "disconnect" || cmd == "dc") {

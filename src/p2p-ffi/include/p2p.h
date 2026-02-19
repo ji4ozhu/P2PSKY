@@ -44,12 +44,6 @@ struct P2pConfigC {
   const char *signaling_url;
   /// STUN server address (NULL = use defaults)
   const char *stun_server;
-  /// TURN server address (NULL = no TURN)
-  const char *turn_server;
-  /// TURN username (NULL if no TURN)
-  const char *turn_username;
-  /// TURN password (NULL if no TURN)
-  const char *turn_password;
   /// Whether to enable IPv6 dual-stack
   bool enable_ipv6;
   /// KCP mode: 0 = Normal, 1 = Fast, 2 = Turbo
@@ -141,6 +135,20 @@ P2pErrorCode p2p_shutdown(P2pHandle *handle);
 /// Register this peer with the signaling server.
 P2pErrorCode p2p_register(P2pHandle *handle, const char *peer_id);
 
+/// Set or clear TURN server configuration dynamically.
+///
+/// Can be called at any time after `p2p_register()`. New connections will use
+/// the updated TURN config. Existing connections are not affected.
+///
+/// To enable TURN: pass non-NULL `server`, `username`, and `password`.
+/// To disable TURN: pass NULL for `server` (username and password are ignored).
+///
+/// The strings are copied internally; the caller may free them after this call returns.
+P2pErrorCode p2p_set_turn_server(P2pHandle *handle,
+                                 const char *server,
+                                 const char *username,
+                                 const char *password);
+
 /// Set callback for connection state changes.
 P2pErrorCode p2p_set_state_callback(P2pHandle *handle,
                                     P2pStateCallbackFn callback,
@@ -157,7 +165,17 @@ P2pErrorCode p2p_set_incoming_callback(P2pHandle *handle,
                                        void *user_data);
 
 /// Initiate a connection to a remote peer.
-P2pErrorCode p2p_connect(P2pHandle *handle, const char *remote_peer_id);
+///
+/// `punch_timeout_ms`: per-connect hole punch timeout in milliseconds.
+///   0 = use the default (15s). If punching doesn't succeed within this time,
+///   the connection falls back to TURN relay (if configured).
+///
+/// `turn_only`: if true, skip hole punching entirely and go straight to TURN relay.
+///   Candidate gathering still runs (TURN allocation is needed), but no probes are sent.
+P2pErrorCode p2p_connect(P2pHandle *handle,
+                         const char *remote_peer_id,
+                         uint32_t punch_timeout_ms,
+                         bool turn_only);
 
 /// Send data to a connected peer.
 P2pErrorCode p2p_send(P2pHandle *handle,
@@ -205,5 +223,16 @@ P2pErrorCode p2p_disable_encryption(P2pHandle *handle, const char *remote_peer_i
 /// When enabled, all packets are wrapped to look like DNS TXT queries,
 /// helping bypass firewalls and DPI that block non-standard UDP traffic.
 P2pErrorCode p2p_enable_dns_disguise(P2pHandle *handle, const char *remote_peer_id, bool enabled);
+
+/// Enable or disable automatic P2P retry for a peer currently using TURN relay.
+///
+/// When enabled, the library periodically attempts hole punching (every 5 seconds)
+/// while the connection is in Relayed state. If a direct P2P path is found, the
+/// session seamlessly switches from TURN relay to direct UDP without interruption.
+///
+/// This is a per-peer dynamic toggle — can be called at any time after `p2p_connect()`.
+/// If called before the connection enters Relayed state, the flag is stored and the
+/// retry loop starts automatically once TURN relay is established.
+P2pErrorCode p2p_enable_p2p_retry(P2pHandle *handle, const char *remote_peer_id, bool enabled);
 
 }  // extern "C"

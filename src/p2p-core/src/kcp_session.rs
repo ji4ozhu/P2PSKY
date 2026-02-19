@@ -162,6 +162,7 @@ impl KcpSession {
         turn_wrap: Arc<parking_lot::RwLock<Option<TurnWrapInfo>>>,
     ) {
         let mut pkt_count: u64 = 0;
+        let mut consecutive_errors: u32 = 0;
         while let Some(kcp_packet) = output_rx.recv().await {
             // Run through send pipeline: FEC -> Encrypt -> DNS Disguise
             let wire_packets = pipeline.process_outgoing(&kcp_packet);
@@ -189,8 +190,29 @@ impl KcpSession {
                     socket.send_to(&pkt, addr).await
                 };
 
-                if let Err(e) = result {
-                    tracing::warn!("UDP send failed: {}", e);
+                match result {
+                    Err(e) => {
+                        consecutive_errors += 1;
+                        // Reduce log spam: log 1st, 10th, then every 100th error
+                        if consecutive_errors == 1
+                            || consecutive_errors == 10
+                            || consecutive_errors.is_multiple_of(100)
+                        {
+                            tracing::warn!(
+                                "UDP send failed (consecutive={}): {}",
+                                consecutive_errors, e
+                            );
+                        }
+                    }
+                    Ok(_) => {
+                        if consecutive_errors > 0 {
+                            tracing::info!(
+                                "UDP send recovered after {} consecutive errors",
+                                consecutive_errors
+                            );
+                            consecutive_errors = 0;
+                        }
+                    }
                 }
             }
         }

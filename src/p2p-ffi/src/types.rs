@@ -13,12 +13,6 @@ pub struct P2pConfigC {
     pub signaling_url: *const c_char,
     /// STUN server address (NULL = use defaults)
     pub stun_server: *const c_char,
-    /// TURN server address (NULL = no TURN)
-    pub turn_server: *const c_char,
-    /// TURN username (NULL if no TURN)
-    pub turn_username: *const c_char,
-    /// TURN password (NULL if no TURN)
-    pub turn_password: *const c_char,
     /// Whether to enable IPv6 dual-stack
     pub enable_ipv6: bool,
     /// KCP mode: 0 = Normal, 1 = Fast, 2 = Turbo

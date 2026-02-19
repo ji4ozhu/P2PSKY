@@ -7,8 +7,6 @@ pub struct P2pConfig {
     pub signaling_url: String,
     /// STUN server addresses for NAT traversal
     pub stun_servers: Vec<String>,
-    /// TURN server address (optional, for relay fallback)
-    pub turn_server: Option<TurnConfig>,
     /// Whether to enable IPv6 (dual-stack)
     pub enable_ipv6: bool,
     /// KCP mode preset
@@ -21,6 +19,10 @@ pub struct P2pConfig {
     pub keepalive_interval: Duration,
     /// Time without any response before considering the connection dead
     pub dead_timeout: Duration,
+    /// Whether automatic reconnection is enabled when a connection dies
+    pub auto_reconnect: bool,
+    /// Maximum number of reconnection attempts before giving up
+    pub max_reconnect_attempts: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -51,13 +53,14 @@ impl Default for P2pConfig {
                 "stun.sipnet.com:3478".to_string(),
                 "stun.f.haeder.net:3478".to_string(),
             ],
-            turn_server: None,
             enable_ipv6: true,
             kcp_mode: KcpMode::Fast,
             stun_timeout: Duration::from_secs(3),
             punch_timeout: Duration::from_secs(15),
             keepalive_interval: Duration::from_secs(10),
             dead_timeout: Duration::from_secs(60),
+            auto_reconnect: true,
+            max_reconnect_attempts: 3,
         }
     }
 }

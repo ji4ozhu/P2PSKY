@@ -20,9 +20,6 @@ struct P2pHandle { uint8_t _private[0]; };
 struct P2pConfigC {
     const char* signaling_url;    // 信令服务器 WebSocket URL
     const char* stun_server;      // STUN 服务器, NULL = 使用默认
-    const char* turn_server;      // TURN 服务器, NULL = 不使用
-    const char* turn_username;    // TURN 用户名
-    const char* turn_password;    // TURN 密码
     bool        enable_ipv6;      // 启用 IPv6 双栈
     uint32_t    kcp_mode;         // 0=Normal, 1=Fast, 2=Turbo
 };
@@ -178,9 +175,18 @@ P2pErrorCode p2p_set_incoming_callback(P2pHandle* handle,
 
 #### `p2p_connect`
 ```c
-P2pErrorCode p2p_connect(P2pHandle* handle, const char* remote_peer_id);
+P2pErrorCode p2p_connect(P2pHandle* handle,
+                          const char* remote_peer_id,
+                          uint32_t punch_timeout_ms,
+                          bool turn_only);
 ```
-异步发起连接。立即返回，进度通过状态回调通知。流程：信令 → STUN 收集候选 → 候选交换 → UDP 打洞 → KCP 建立。打洞失败自动切换 TURN 中继。
+异步发起连接。立即返回，进度通过状态回调通知。
+
+**参数**：
+- `punch_timeout_ms`：打洞超时（毫秒）。`0` = 使用默认 15 秒。如果在此时间内 P2P 打洞未成功，自动切换 TURN 中继。
+- `turn_only`：是否跳过打洞直接走 TURN 中继。`true` = 跳过打洞，TURN 分配完成后直接建立中继连接。`false`（默认）= 正常打洞流程。
+
+流程：信令 → STUN 收集候选 → 候选交换 → UDP 打洞 → KCP 建立。打洞失败自动切换 TURN 中继。`turn_only=true` 时跳过打洞步骤。
 
 #### `p2p_send`
 ```c
@@ -210,6 +216,20 @@ P2pErrorCode p2p_get_stats(P2pHandle* handle,
 
 所有功能开关会自动通过 KCP 控制消息与对端协商，无需手动同步。
 
+#### `p2p_set_turn_server`
+```c
+P2pErrorCode p2p_set_turn_server(P2pHandle* handle,
+                                  const char* server,
+                                  const char* username,
+                                  const char* password);
+```
+动态设置或清除 TURN 服务器配置。可在 `p2p_register()` 之后任意时刻调用。
+
+- **启用 TURN**：传入非 NULL 的 `server`（如 `"turn.example.com:3478"`）、`username`、`password`。
+- **禁用 TURN**：`server` 传 NULL（`username` 和 `password` 将被忽略）。
+
+更新后的配置仅影响后续新连接（`p2p_connect()` 时生效）。已有连接的 TURN 状态不受影响。TURN 中继作为 UDP 打洞失败后的兜底方案自动启用。
+
 #### `p2p_enable_fec`
 ```c
 P2pErrorCode p2p_enable_fec(P2pHandle* handle,
@@ -237,6 +257,19 @@ P2pErrorCode p2p_enable_dns_disguise(P2pHandle* handle,
                                       const char* remote_peer_id,
                                       bool enabled);
 ```
+
+#### `p2p_enable_p2p_retry`
+```c
+P2pErrorCode p2p_enable_p2p_retry(P2pHandle* handle,
+                                    const char* remote_peer_id,
+                                    bool enabled);
+```
+动态开关 Relayed 状态下的 P2P 自动重试。开启后，每 5 秒尝试一次打洞（3 秒超时），成功则无缝从 TURN 中继切换到 P2P 直连。
+
+- **per-peer 动态开关**：可在 `p2p_connect()` 之后任意时刻调用，类似 `p2p_enable_fec()`
+- 如果调用时连接尚未进入 Relayed 状态，标记会被保存，进入 Relayed 后自动启动重试
+- 切换过程中数据传输不中断（先切换地址，再关闭 TURN 包装）
+- 成功后状态回调通知 `Connected`
 
 ### 工具
 
@@ -281,13 +314,14 @@ int main() {
     p2p_set_incoming_callback(h, on_incoming, NULL);
 
     p2p_register(h, "alice");
-    p2p_connect(h, "bob");
+    p2p_connect(h, "bob", 0, false);  // 0 = 默认超时, false = 正常打洞
 
     const char* msg = "Hello";
     p2p_send(h, "bob", (const uint8_t*)msg, strlen(msg));
 
     p2p_enable_fec(h, "bob", true);
     p2p_enable_encryption(h, "bob");
+    p2p_enable_p2p_retry(h, "bob", true);  // Relayed 时自动重试 P2P
 
     P2pStatsC stats;
     p2p_get_stats(h, "bob", &stats);
@@ -339,7 +373,7 @@ int main() {
         [](const char*, void*) -> bool { return true; }, nullptr);
 
     p2p_register(h, "my_id");
-    p2p_connect(h, "remote_id");
+    p2p_connect(h, "remote_id", 2000, false);  // 2秒打洞超时
 
     while (!connected)
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -379,9 +413,6 @@ public static class P2p
     {
         public IntPtr signaling_url;
         public IntPtr stun_server;
-        public IntPtr turn_server;
-        public IntPtr turn_username;
-        public IntPtr turn_password;
         [MarshalAs(UnmanagedType.U1)] public bool enable_ipv6;
         public uint kcp_mode;
     }
@@ -422,7 +453,9 @@ public static class P2p
     [DllImport(DLL)] public static extern IntPtr p2p_init(ref ConfigC config);
     [DllImport(DLL)] public static extern int p2p_shutdown(IntPtr handle);
     [DllImport(DLL)] public static extern int p2p_register(IntPtr handle, string peer_id);
-    [DllImport(DLL)] public static extern int p2p_connect(IntPtr handle, string peer_id);
+    [DllImport(DLL)] public static extern int p2p_connect(IntPtr handle, string peer_id,
+                                                            uint punch_timeout_ms,
+                                                            [MarshalAs(UnmanagedType.U1)] bool turn_only);
     [DllImport(DLL)] public static extern int p2p_send(IntPtr handle, string peer_id,
                                                         byte[] data, uint len);
     [DllImport(DLL)] public static extern int p2p_disconnect(IntPtr handle, string peer_id);
@@ -434,6 +467,10 @@ public static class P2p
     [DllImport(DLL)] public static extern int p2p_disable_encryption(IntPtr handle, string peer_id);
     [DllImport(DLL)] public static extern int p2p_enable_dns_disguise(IntPtr handle, string peer_id,
                                                                        [MarshalAs(UnmanagedType.U1)] bool on);
+    [DllImport(DLL)] public static extern int p2p_enable_p2p_retry(IntPtr handle, string peer_id,
+                                                                     [MarshalAs(UnmanagedType.U1)] bool on);
+    [DllImport(DLL)] public static extern int p2p_set_turn_server(IntPtr handle, string server,
+                                                                    string username, string password);
     [DllImport(DLL)] public static extern int p2p_set_state_callback(IntPtr h, StateCallback cb, IntPtr ud);
     [DllImport(DLL)] public static extern int p2p_set_receive_callback(IntPtr h, ReceiveCallback cb, IntPtr ud);
     [DllImport(DLL)] public static extern int p2p_set_incoming_callback(IntPtr h, IncomingCallback cb, IntPtr ud);
@@ -448,7 +485,7 @@ class Program {
         Marshal.FreeHGlobal(url);
 
         P2p.p2p_register(h, "my_id");
-        P2p.p2p_connect(h, "peer_id");
+        P2p.p2p_connect(h, "peer_id", 0, false);
 
         byte[] data = Encoding.UTF8.GetBytes("Hello from C#!");
         P2p.p2p_send(h, "peer_id", data, (uint)data.Length);
@@ -469,9 +506,6 @@ class P2pConfigC(ctypes.Structure):
     _fields_ = [
         ("signaling_url", ctypes.c_char_p),
         ("stun_server", ctypes.c_char_p),
-        ("turn_server", ctypes.c_char_p),
-        ("turn_username", ctypes.c_char_p),
-        ("turn_password", ctypes.c_char_p),
         ("enable_ipv6", ctypes.c_bool),
         ("kcp_mode", ctypes.c_uint32),
     ]
@@ -522,8 +556,9 @@ h = lib.p2p_init(ctypes.byref(config))
 lib.p2p_set_state_callback(h, _state_cb, None)
 lib.p2p_set_receive_callback(h, _recv_cb, None)
 lib.p2p_register(h, b"my_id")
-lib.p2p_connect(h, b"peer_id")
+lib.p2p_connect(h, b"peer_id", 0, False)  # 0 = 默认超时, False = 正常打洞
 lib.p2p_send(h, b"peer_id", b"Hello from Python!", 18)
+lib.p2p_enable_p2p_retry(h, b"peer_id", True)  # 开启 P2P 自动重试
 lib.p2p_shutdown(h)
 ```
 
@@ -535,11 +570,9 @@ import com.sun.jna.*;
 public interface P2pLib extends Library {
     P2pLib INSTANCE = Native.load("p2p", P2pLib.class);
 
-    @Structure.FieldOrder({"signaling_url", "stun_server", "turn_server",
-                           "turn_username", "turn_password", "enable_ipv6", "kcp_mode"})
+    @Structure.FieldOrder({"signaling_url", "stun_server", "enable_ipv6", "kcp_mode"})
     class P2pConfigC extends Structure {
-        public String signaling_url, stun_server, turn_server;
-        public String turn_username, turn_password;
+        public String signaling_url, stun_server;
         public boolean enable_ipv6;
         public int kcp_mode;
     }
@@ -568,7 +601,7 @@ public interface P2pLib extends Library {
     Pointer p2p_init(P2pConfigC config);
     int p2p_shutdown(Pointer h);
     int p2p_register(Pointer h, String peer_id);
-    int p2p_connect(Pointer h, String peer_id);
+    int p2p_connect(Pointer h, String peer_id, int punch_timeout_ms, boolean turn_only);
     int p2p_send(Pointer h, String peer_id, byte[] data, int len);
     int p2p_disconnect(Pointer h, String peer_id);
     int p2p_get_stats(Pointer h, String peer_id, P2pStatsC stats);
@@ -576,6 +609,8 @@ public interface P2pLib extends Library {
     int p2p_enable_encryption(Pointer h, String peer_id);
     int p2p_disable_encryption(Pointer h, String peer_id);
     int p2p_enable_dns_disguise(Pointer h, String peer_id, boolean on);
+    int p2p_enable_p2p_retry(Pointer h, String peer_id, boolean on);
+    int p2p_set_turn_server(Pointer h, String server, String username, String password);
 }
 ```
 
@@ -592,12 +627,13 @@ config.kcp_mode = 1
 guard let h = p2p_init(&config) else { fatalError("init failed") }
 
 p2p_register(h, "ios_device")
-p2p_connect(h, "peer_id")
+p2p_connect(h, "peer_id", 0, false)  // 默认超时, 正常打洞
 
 let data: [UInt8] = Array("Hello from iOS!".utf8)
 p2p_send(h, "peer_id", data, UInt32(data.count))
 
 p2p_enable_encryption(h, "peer_id")
+p2p_enable_p2p_retry(h, "peer_id", true)  // Relayed 时自动重试 P2P
 p2p_shutdown(h)
 ```
 

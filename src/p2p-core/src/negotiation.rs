@@ -34,6 +34,8 @@ pub const FRAME_CONTROL: u8 = 0x01;
 
 pub const MSG_CONFIG_REQUEST: u8 = 0x01;
 pub const MSG_CONFIG_ACK: u8 = 0x02;
+pub const MSG_KEEPALIVE_PING: u8 = 0x03;
+pub const MSG_KEEPALIVE_PONG: u8 = 0x04;
 
 // --- Feature identifiers ---
 
@@ -70,6 +72,8 @@ fn next_seq() -> u8 {
 pub enum ControlMessage {
     ConfigRequest(ConfigRequest),
     ConfigAck(ConfigAck),
+    KeepalivePing,
+    KeepalivePong,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -109,6 +113,16 @@ pub fn build_config_request(feature: u8, action: u8, key: Option<&[u8; 32]>) -> 
 /// Build a ConfigAck control message (without the FRAME_CONTROL prefix).
 pub fn build_config_ack(seq: u8, feature: u8, action: u8, status: u8) -> Vec<u8> {
     vec![MSG_CONFIG_ACK, seq, feature, action, status]
+}
+
+/// Build a Keepalive Ping control message (without the FRAME_CONTROL prefix).
+pub fn build_keepalive_ping() -> Vec<u8> {
+    vec![MSG_KEEPALIVE_PING]
+}
+
+/// Build a Keepalive Pong control message (without the FRAME_CONTROL prefix).
+pub fn build_keepalive_pong() -> Vec<u8> {
+    vec![MSG_KEEPALIVE_PONG]
 }
 
 /// Parse a control message from raw bytes (after stripping the FRAME_CONTROL prefix).
@@ -157,6 +171,8 @@ pub fn parse_control_message(data: &[u8]) -> Result<ControlMessage, &'static str
                 status: data[4],
             }))
         }
+        MSG_KEEPALIVE_PING => Ok(ControlMessage::KeepalivePing),
+        MSG_KEEPALIVE_PONG => Ok(ControlMessage::KeepalivePong),
         _ => Err("unknown control message type"),
     }
 }

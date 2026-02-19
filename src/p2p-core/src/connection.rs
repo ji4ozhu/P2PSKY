@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rand::{RngCore, rngs::OsRng};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -14,7 +15,7 @@ use p2p_stun::{StunClient, StunResponseRouter};
 use p2p_turn::TurnCredentials;
 
 use crate::candidate::{Candidate, gather_host_candidates};
-use crate::config::P2pConfig;
+use crate::config::{P2pConfig, TurnConfig};
 use crate::dual_stack::DualStackSocket;
 use crate::error::P2pError;
 use crate::kcp_session::{KcpSession, classify_packet, PacketType};
@@ -41,9 +42,18 @@ pub type StateCallback = Box<dyn Fn(&str, ConnectionState) + Send + Sync>;
 pub type ReceiveCallback = Box<dyn Fn(&str, &[u8]) + Send + Sync>;
 pub type IncomingCallback = Box<dyn Fn(&str) -> bool + Send + Sync>;
 
+/// Reconnection bookkeeping for a peer. Stored separately from PeerConnection
+/// so it survives connection cleanup during gathering timeouts.
+struct ReconnectState {
+    attempts: u32,
+    was_connected: bool,
+}
+
 /// Manages all P2P connections.
 pub struct ConnectionManager {
     config: P2pConfig,
+    /// Dynamic TURN server configuration. Updated via set_turn_config().
+    turn_config: Arc<RwLock<Option<TurnConfig>>>,
     socket: Arc<DualStackSocket>,
     signaling_tx: Arc<Mutex<Option<SignalingSender>>>,
     connections: Arc<Mutex<HashMap<String, PeerConnection>>>,
@@ -66,6 +76,12 @@ pub struct ConnectionManager {
     signaling_task: Mutex<Option<JoinHandle<()>>>,
     /// H7: Handle to the WebSocket I/O task for the signaling client.
     signaling_io_task: Mutex<Option<JoinHandle<()>>>,
+    /// Background health monitor task (keepalive + dead detection).
+    health_task: Mutex<Option<JoinHandle<()>>>,
+    /// Set to true during shutdown to prevent reconnection attempts.
+    shutting_down: portable_atomic::AtomicBool,
+    /// Reconnection state per peer (survives PeerConnection removal).
+    reconnect_state: Arc<Mutex<HashMap<String, ReconnectState>>>,
 }
 
 /// State for a single peer connection.
@@ -92,6 +108,14 @@ struct PeerConnection {
     turn_allocation: Option<p2p_turn::TurnAllocation>,
     /// TURN channel number assigned for this peer.
     turn_channel: Option<u16>,
+    /// Per-connect punch timeout override. None = use default from config.
+    punch_timeout_override: Option<Duration>,
+    /// Skip hole punching entirely and go straight to TURN relay.
+    turn_only: bool,
+    /// Whether automatic P2P retry is enabled while in Relayed state.
+    p2p_retry_enabled: bool,
+    /// Handle for the P2P retry background task (aborted on disable/disconnect).
+    p2p_retry_task: Option<JoinHandle<()>>,
 }
 
 impl ConnectionManager {
@@ -102,6 +126,7 @@ impl ConnectionManager {
 
         let manager = Arc::new(Self {
             config,
+            turn_config: Arc::new(RwLock::new(None)),
             socket,
             signaling_tx: Arc::new(Mutex::new(None)),
             connections: Arc::new(Mutex::new(HashMap::new())),
@@ -114,12 +139,33 @@ impl ConnectionManager {
             recv_task: Mutex::new(None),
             signaling_task: Mutex::new(None),
             signaling_io_task: Mutex::new(None),
+            health_task: Mutex::new(None),
+            shutting_down: portable_atomic::AtomicBool::new(false),
+            reconnect_state: Arc::new(Mutex::new(HashMap::new())),
         });
 
         // Start the UDP receive loop
         manager.start_recv_loop();
 
+        // Start the health monitor (keepalive + dead connection detection)
+        manager.start_health_monitor();
+
         Ok(manager)
+    }
+
+    /// Dynamically set or clear the TURN server configuration.
+    ///
+    /// If `config` is `Some`, new connections will attempt TURN relay allocation
+    /// as a fallback when hole punching fails. If `None`, TURN is disabled.
+    /// Only affects new connections; existing connections are not affected.
+    pub fn set_turn_config(&self, config: Option<TurnConfig>) {
+        let mut guard = self.turn_config.write();
+        if let Some(ref c) = config {
+            tracing::info!("TURN config updated: server={}", c.server_addr);
+        } else {
+            tracing::info!("TURN config cleared (disabled)");
+        }
+        *guard = config;
     }
 
     /// Connect to the signaling server and register with the given peer ID.
@@ -144,7 +190,19 @@ impl ConnectionManager {
     }
 
     /// Initiate a connection to a remote peer.
-    pub async fn connect(self: &Arc<Self>, remote_peer_id: &str) -> Result<(), P2pError> {
+    ///
+    /// `punch_timeout` overrides the global punch timeout for this connection.
+    /// `None` means use the default from config (15s).
+    ///
+    /// `turn_only` skips hole punching entirely: candidate gathering still runs
+    /// (TURN allocation is needed), but once TURN is ready the connection goes
+    /// straight to relay mode without attempting any probes.
+    pub async fn connect(
+        self: &Arc<Self>,
+        remote_peer_id: &str,
+        punch_timeout: Option<Duration>,
+        turn_only: bool,
+    ) -> Result<(), P2pError> {
         let session_id = uuid::Uuid::new_v4().to_string();
         let session_hash = punch::compute_session_hash(&session_id);
 
@@ -179,6 +237,10 @@ impl ConnectionManager {
                     answer_received: false,
                     turn_allocation: None,
                     turn_channel: None,
+                    punch_timeout_override: punch_timeout,
+                    turn_only,
+                    p2p_retry_enabled: false,
+                    p2p_retry_task: None,
                 },
             );
         }
@@ -191,13 +253,16 @@ impl ConnectionManager {
         // Spawn background STUN/TURN gathering — results trickle in asynchronously
         self.spawn_reflexive_gathering(remote_peer_id);
 
-        // Try to start punching now that we have local host candidates.
-        // If the remote Answer and candidates already arrived, punch starts immediately
-        // without waiting for STUN results.
-        self.try_start_punching(remote_peer_id).await;
+        if !turn_only {
+            // Try to start punching now that we have local host candidates.
+            // If the remote Answer and candidates already arrived, punch starts immediately
+            // without waiting for STUN results.
+            self.try_start_punching(remote_peer_id).await;
+        }
 
         // Spawn a gathering timeout watchdog: if we're still in Gathering after
         // 10 seconds (waiting for Answer or remote candidates), fail the connection.
+        // For turn_only mode, this ensures we don't wait forever for TURN allocation.
         self.spawn_gathering_timeout(remote_peer_id);
 
         Ok(())
@@ -234,11 +299,16 @@ impl ConnectionManager {
             if let Some(h) = conn.punch_task.take() {
                 h.abort();
             }
+            if let Some(h) = conn.p2p_retry_task.take() {
+                h.abort();
+            }
             // M4: Remove conv_id index entry
             if let Some(session) = &conn.kcp_session {
                 self.conv_id_index.lock().remove(&session.conv_id());
             }
             drop(connections);
+            // Explicit disconnect clears reconnect state
+            self.reconnect_state.lock().remove(remote_peer_id);
             self.notify_state(remote_peer_id, ConnectionState::Disconnected);
         }
     }
@@ -253,6 +323,8 @@ impl ConnectionManager {
     /// After shutdown, the manager is inert — recv loop and signaling handler
     /// are stopped, and all peer connections are removed.
     pub fn shutdown(&self) {
+        // Signal all reconnection loops to stop
+        self.shutting_down.store(true, Relaxed);
         // Abort tracked background tasks
         if let Some(h) = self.recv_task.lock().take() {
             h.abort();
@@ -262,6 +334,10 @@ impl ConnectionManager {
         }
         // H7: Abort the signaling WebSocket I/O task
         if let Some(h) = self.signaling_io_task.lock().take() {
+            h.abort();
+        }
+        // Abort health monitor
+        if let Some(h) = self.health_task.lock().take() {
             h.abort();
         }
         // Drop the signaling sender to unblock any pending sends
@@ -306,7 +382,8 @@ impl ConnectionManager {
             while let Some(msg) = rx.recv().await {
                 manager.handle_signaling_message(msg).await;
             }
-            tracing::warn!("Signaling receiver closed");
+            tracing::warn!("Signaling receiver closed, initiating reconnection");
+            manager.on_signaling_lost().await;
         });
         *self.signaling_task.lock() = Some(handle);
     }
@@ -414,8 +491,35 @@ impl ConnectionManager {
             payload.session_id
         );
 
-        // Ask the application whether to accept
-        let accepted = {
+        // Check if this is a reconnection from a previously connected peer
+        let auto_accept = {
+            let rs = self.reconnect_state.lock();
+            rs.get(from).map(|s| s.was_connected).unwrap_or(false)
+        };
+
+        let accepted = if auto_accept {
+            tracing::info!(
+                "Auto-accepting reconnection from previously connected peer '{}'",
+                from
+            );
+            // Clean up old connection state before re-establishing
+            {
+                let mut connections = self.connections.lock();
+                if let Some(mut old_conn) = connections.remove(from) {
+                    if let Some(h) = old_conn.punch_task.take() {
+                        h.abort();
+                    }
+                    if let Some(h) = old_conn.p2p_retry_task.take() {
+                        h.abort();
+                    }
+                    if let Some(session) = &old_conn.kcp_session {
+                        self.conv_id_index.lock().remove(&session.conv_id());
+                    }
+                }
+            }
+            true
+        } else {
+            // Ask the application whether to accept
             let cb = self.incoming_cb.lock();
             if let Some(cb) = cb.as_ref() {
                 cb(from)
@@ -471,6 +575,10 @@ impl ConnectionManager {
                     answer_received: true,
                     turn_allocation: None,
                     turn_channel: None,
+                    punch_timeout_override: None,
+                    turn_only: false,
+                    p2p_retry_enabled: false,
+                    p2p_retry_task: None,
                 },
             );
         }
@@ -666,6 +774,10 @@ impl ConnectionManager {
                     answer_received: false,
                     turn_allocation: None,
                     turn_channel: None,
+                    punch_timeout_override: None,
+                    turn_only: false,
+                    p2p_retry_enabled: false,
+                    p2p_retry_task: None,
                 },
             );
         }
@@ -762,16 +874,20 @@ impl ConnectionManager {
     /// Called from background STUN/TURN tasks as results arrive. Stores the
     /// candidate, sends it via signaling, and tries to start punching if
     /// conditions are now met.
+    ///
+    /// In `turn_only` mode, when a relay candidate arrives the connection
+    /// bypasses hole punching and goes straight to TURN relay.
     async fn trickle_local_candidate(self: &Arc<Self>, peer_id: &str, candidate: Candidate) {
-        // 1. Store the candidate (with dedup)
-        let session_id = {
+        // 1. Store the candidate (with dedup) and check turn_only status
+        let (session_id, is_turn_only, is_relay_candidate) = {
             let mut connections = self.connections.lock();
             if let Some(conn) = connections.get_mut(peer_id) {
                 if conn.local_candidates.iter().any(|c| c.address == candidate.address) {
                     return;
                 }
+                let is_relay = candidate.candidate_type == p2p_signaling_proto::CandidateType::Relay;
                 conn.local_candidates.push(candidate.clone());
-                conn.session_id.clone()
+                (conn.session_id.clone(), conn.turn_only, is_relay)
             } else {
                 return;
             }
@@ -794,7 +910,17 @@ impl ConnectionManager {
             candidate.candidate_type, candidate.address, peer_id
         );
 
-        // 3. Try to start punching (if not already started and conditions now met)
+        // 3. In turn_only mode, trigger direct TURN relay when relay candidate arrives
+        if is_turn_only && is_relay_candidate {
+            tracing::info!(
+                "turn_only mode: TURN allocation ready for '{}', establishing relay directly",
+                peer_id
+            );
+            self.try_direct_turn_relay(peer_id).await;
+            return;
+        }
+
+        // 4. Try to start punching (if not already started and conditions now met)
         self.try_start_punching(peer_id).await;
     }
 
@@ -920,7 +1046,7 @@ impl ConnectionManager {
         }
 
         // TURN allocation task (if configured)
-        if let Some(turn_config) = self.config.turn_server.clone() {
+        if let Some(turn_config) = self.turn_config.read().clone() {
             let manager_weak = Arc::downgrade(self);
             let peer_id = peer_id.to_string();
             tokio::spawn(async move {
@@ -1135,9 +1261,13 @@ impl ConnectionManager {
         // Atomic check-and-transition to prevent concurrent callers from
         // both starting punch (possible with trickle candidates arriving
         // from multiple background STUN tasks).
-        let should_start = {
+        let (should_start, punch_timeout) = {
             let mut connections = self.connections.lock();
             if let Some(conn) = connections.get_mut(peer_id) {
+                // Skip punching entirely in turn_only mode
+                if conn.turn_only {
+                    return;
+                }
                 if conn.state == ConnectionState::Gathering
                     && !conn.local_candidates.is_empty()
                     && !conn.remote_candidates.is_empty()
@@ -1145,12 +1275,14 @@ impl ConnectionManager {
                     && conn.punch_task.is_none()
                 {
                     conn.state = ConnectionState::Punching;
-                    true
+                    let timeout = conn.punch_timeout_override
+                        .unwrap_or(self.config.punch_timeout);
+                    (true, timeout)
                 } else {
-                    false
+                    (false, Duration::ZERO)
                 }
             } else {
-                false
+                (false, Duration::ZERO)
             }
         };
 
@@ -1191,7 +1323,7 @@ impl ConnectionManager {
         let manager = self.clone();
         let peer_id_owned = peer_id.to_string();
         let socket = self.socket.clone();
-        let timeout = self.config.punch_timeout;
+        let timeout = punch_timeout;
 
         let handle = tokio::spawn(async move {
             tracing::info!("Starting hole punch for '{}'...", peer_id_owned);
@@ -1232,6 +1364,124 @@ impl ConnectionManager {
         }
     }
 
+    /// Establish a KCP session directly over TURN relay, skipping hole punching.
+    ///
+    /// Used in `turn_only` mode: when the TURN allocation completes, this method
+    /// creates the KCP session routed through the relay without attempting any
+    /// UDP probes. Reuses the same relay setup logic as `on_punch_failed()`.
+    async fn try_direct_turn_relay(self: &Arc<Self>, peer_id: &str) {
+        let turn_info = {
+            let connections = self.connections.lock();
+            if let Some(conn) = connections.get(peer_id) {
+                // Only proceed if we're still in Gathering (not already connected/relayed)
+                if conn.state != ConnectionState::Gathering {
+                    return;
+                }
+                conn.turn_allocation.as_ref().map(|alloc| {
+                    (alloc.server_addr, alloc.relayed_addr, conn.session_id.clone())
+                })
+            } else {
+                None
+            }
+        };
+
+        let (turn_server, relay_addr, session_id) = match turn_info {
+            Some(info) => info,
+            None => {
+                tracing::warn!(
+                    "turn_only mode but no TURN allocation for '{}' — waiting",
+                    peer_id
+                );
+                return;
+            }
+        };
+
+        tracing::info!(
+            "Direct TURN relay for '{}': relay={}, server={}",
+            peer_id, relay_addr, turn_server
+        );
+
+        let conv_id = punch::derive_conv_id(&session_id);
+
+        // Assign a channel number for this peer
+        let channel = {
+            let mut connections = self.connections.lock();
+            let next = connections.values()
+                .filter_map(|c| c.turn_channel)
+                .max()
+                .unwrap_or(0x3FFF) + 1;
+            if next > 0x7FFF {
+                tracing::error!(
+                    "TURN channel number overflow for '{}': 0x{:04X} > 0x7FFF",
+                    peer_id, next
+                );
+                if let Some(mut conn) = connections.remove(peer_id) {
+                    if let Some(h) = conn.punch_task.take() {
+                        h.abort();
+                    }
+                    if let Some(session) = &conn.kcp_session {
+                        self.conv_id_index.lock().remove(&session.conv_id());
+                    }
+                }
+                drop(connections);
+                self.notify_state(peer_id, ConnectionState::Disconnected);
+                return;
+            }
+            if let Some(conn) = connections.get_mut(peer_id) {
+                conn.turn_channel = Some(next);
+            }
+            next
+        };
+
+        // Create KCP session and enable TURN relay wrapping
+        let session = KcpSession::new(
+            conv_id,
+            turn_server,
+            self.socket.clone(),
+            self.config.kcp_mode,
+        );
+        session.enable_turn_relay(channel, turn_server);
+        session.stats.is_relayed.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        {
+            let mut connections = self.connections.lock();
+            if let Some(conn) = connections.get_mut(peer_id) {
+                conn.kcp_session = Some(Arc::new(session));
+                conn.remote_addr = Some(turn_server);
+                conn.state = ConnectionState::Relayed;
+                conn.probe_tx = None;
+                conn.candidate_tx = None;
+                conn.punch_task = None;
+
+                // Auto-start P2P retry loop if flag was pre-set
+                if conn.p2p_retry_enabled && conn.p2p_retry_task.is_none() {
+                    let manager_weak = Arc::downgrade(self);
+                    let pid = peer_id.to_string();
+                    conn.p2p_retry_task = Some(tokio::spawn(async move {
+                        Self::run_p2p_retry_loop(manager_weak, pid).await;
+                    }));
+                }
+            }
+            self.conv_id_index.lock().insert(conv_id, peer_id.to_string());
+        }
+
+        // Reset reconnection state on successful relay
+        {
+            let mut rs = self.reconnect_state.lock();
+            if let Some(state) = rs.get_mut(peer_id) {
+                state.attempts = 0;
+                state.was_connected = true;
+            } else {
+                rs.insert(peer_id.to_string(), ReconnectState {
+                    attempts: 0,
+                    was_connected: true,
+                });
+            }
+        }
+
+        self.notify_state(peer_id, ConnectionState::Relayed);
+    }
+
     /// Called when hole punching succeeds. Creates the KCP session.
     async fn on_punch_success(
         self: &Arc<Self>,
@@ -1266,6 +1516,20 @@ impl ConnectionManager {
             }
             // M4: Register conv_id → peer_id mapping for fast packet routing
             self.conv_id_index.lock().insert(conv_id, peer_id.to_string());
+        }
+
+        // Reset reconnection state on successful connection
+        {
+            let mut rs = self.reconnect_state.lock();
+            if let Some(state) = rs.get_mut(peer_id) {
+                state.attempts = 0;
+                state.was_connected = true;
+            } else {
+                rs.insert(peer_id.to_string(), ReconnectState {
+                    attempts: 0,
+                    was_connected: true,
+                });
+            }
         }
 
         self.notify_state(peer_id, ConnectionState::Connected);
@@ -1350,9 +1614,32 @@ impl ConnectionManager {
                     conn.probe_tx = None;
                     conn.candidate_tx = None;
                     conn.punch_task = None;
+
+                    // Auto-start P2P retry loop if flag was pre-set
+                    if conn.p2p_retry_enabled && conn.p2p_retry_task.is_none() {
+                        let manager_weak = Arc::downgrade(self);
+                        let pid = peer_id.to_string();
+                        conn.p2p_retry_task = Some(tokio::spawn(async move {
+                            Self::run_p2p_retry_loop(manager_weak, pid).await;
+                        }));
+                    }
                 }
                 // M4: Register conv_id → peer_id mapping for fast packet routing
                 self.conv_id_index.lock().insert(conv_id, peer_id.to_string());
+            }
+
+            // Reset reconnection state on successful relay
+            {
+                let mut rs = self.reconnect_state.lock();
+                if let Some(state) = rs.get_mut(peer_id) {
+                    state.attempts = 0;
+                    state.was_connected = true;
+                } else {
+                    rs.insert(peer_id.to_string(), ReconnectState {
+                        attempts: 0,
+                        was_connected: true,
+                    });
+                }
             }
 
             self.notify_state(peer_id, ConnectionState::Relayed);
@@ -1526,6 +1813,155 @@ impl ConnectionManager {
         Ok(snap)
     }
 
+    /// Enable or disable automatic P2P retry for a peer currently in Relayed state.
+    ///
+    /// When enabled, a background task periodically attempts hole punching (every 5s
+    /// with a 3s timeout). If punching succeeds, the session seamlessly switches from
+    /// TURN relay to direct P2P (`switch_remote()` + `disable_turn_relay()`).
+    ///
+    /// This is a per-peer dynamic toggle, similar to `enable_fec()`.
+    pub fn enable_p2p_retry(
+        self: &Arc<Self>,
+        remote_peer_id: &str,
+        enabled: bool,
+    ) -> Result<(), P2pError> {
+        let mut connections = self.connections.lock();
+        let conn = connections
+            .get_mut(remote_peer_id)
+            .ok_or_else(|| P2pError::PeerNotFound(remote_peer_id.to_string()))?;
+
+        conn.p2p_retry_enabled = enabled;
+
+        if enabled {
+            // Only spawn retry loop if currently relayed and no retry task running
+            if conn.state == ConnectionState::Relayed && conn.p2p_retry_task.is_none() {
+                let manager_weak = Arc::downgrade(self);
+                let peer_id = remote_peer_id.to_string();
+                let handle = tokio::spawn(async move {
+                    Self::run_p2p_retry_loop(manager_weak, peer_id).await;
+                });
+                conn.p2p_retry_task = Some(handle);
+                tracing::info!("P2P retry enabled for '{}'", remote_peer_id);
+            } else {
+                tracing::info!(
+                    "P2P retry flag set for '{}' (will activate when Relayed)",
+                    remote_peer_id
+                );
+            }
+        } else {
+            // Abort existing retry task
+            if let Some(h) = conn.p2p_retry_task.take() {
+                h.abort();
+                tracing::info!("P2P retry disabled for '{}'", remote_peer_id);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Background loop that periodically attempts P2P hole punching while in Relayed state.
+    ///
+    /// Uses `Weak<ConnectionManager>` to avoid preventing shutdown. Exits if:
+    /// - The manager is dropped
+    /// - The peer is disconnected
+    /// - The connection is no longer in Relayed state
+    /// - `p2p_retry_enabled` is cleared
+    async fn run_p2p_retry_loop(manager_weak: std::sync::Weak<ConnectionManager>, peer_id: String) {
+        loop {
+            // Wait 5 seconds between retry attempts
+            tokio::time::sleep(Duration::from_secs(5)).await;
+
+            let manager = match manager_weak.upgrade() {
+                Some(m) => m,
+                None => {
+                    tracing::debug!("P2P retry loop for '{}': manager dropped, exiting", peer_id);
+                    return;
+                }
+            };
+
+            // Check if we should still be retrying
+            let (should_retry, remote_candidates, session_id) = {
+                let connections = manager.connections.lock();
+                if let Some(conn) = connections.get(&peer_id) {
+                    if conn.state != ConnectionState::Relayed || !conn.p2p_retry_enabled {
+                        tracing::debug!(
+                            "P2P retry loop for '{}': state={:?}, enabled={}, exiting",
+                            peer_id, conn.state, conn.p2p_retry_enabled
+                        );
+                        return;
+                    }
+                    (true, conn.remote_candidates.clone(), conn.session_id.clone())
+                } else {
+                    return;
+                }
+            };
+
+            if !should_retry || remote_candidates.is_empty() {
+                continue;
+            }
+
+            tracing::info!("P2P retry attempt for '{}'...", peer_id);
+
+            // Run a short hole punch attempt (3s timeout, no dynamic candidate feed)
+            let (_probe_tx, probe_rx) = mpsc::unbounded_channel();
+            let (_cand_tx, candidate_rx) = mpsc::unbounded_channel();
+
+            let result = punch::run_hole_punch(
+                manager.socket.clone(),
+                remote_candidates,
+                &session_id,
+                Duration::from_secs(3),
+                probe_rx,
+                candidate_rx,
+            )
+            .await;
+
+            match result {
+                Ok(punch_result) => {
+                    tracing::info!(
+                        "P2P retry succeeded for '{}': remote_addr={}",
+                        peer_id, punch_result.remote_addr
+                    );
+
+                    // Seamlessly switch from TURN to direct P2P
+                    let switched = {
+                        let mut connections = manager.connections.lock();
+                        if let Some(conn) = connections.get_mut(&peer_id) {
+                            if conn.state == ConnectionState::Relayed {
+                                if let Some(session) = &conn.kcp_session {
+                                    session.switch_remote(punch_result.remote_addr);
+                                    session.disable_turn_relay();
+                                    session.stats.is_relayed.store(
+                                        false,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                }
+                                conn.remote_addr = Some(punch_result.remote_addr);
+                                conn.state = ConnectionState::Connected;
+                                // Clear retry task reference (we're exiting the loop)
+                                conn.p2p_retry_task = None;
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    };
+
+                    if switched {
+                        manager.notify_state(&peer_id, ConnectionState::Connected);
+                    }
+                    return; // Success — exit retry loop
+                }
+                Err(e) => {
+                    tracing::debug!("P2P retry failed for '{}': {}", peer_id, e);
+                    // Continue loop — will retry after 5s
+                }
+            }
+        }
+    }
+
     /// Enable/disable FEC for a peer session (with automatic peer notification).
     pub fn enable_fec(&self, remote_peer_id: &str, enabled: bool) -> Result<(), P2pError> {
         let session = {
@@ -1622,6 +2058,23 @@ impl ConnectionManager {
             }
             Ok(negotiation::ControlMessage::ConfigAck(ack)) => {
                 self.handle_config_ack(peer_id, ack);
+            }
+            Ok(negotiation::ControlMessage::KeepalivePing) => {
+                // Respond with pong
+                let session = {
+                    let connections = self.connections.lock();
+                    connections.get(peer_id)
+                        .and_then(|c| c.kcp_session.as_ref().cloned())
+                };
+                if let Some(session) = session {
+                    let pong = negotiation::build_keepalive_pong();
+                    let _ = self.send_control_raw(&session, &pong);
+                    tracing::trace!("Keepalive ping from '{}', sent pong", peer_id);
+                }
+            }
+            Ok(negotiation::ControlMessage::KeepalivePong) => {
+                // Keepalive pong received — no action needed
+                tracing::trace!("Keepalive pong from '{}'", peer_id);
             }
             Err(e) => {
                 tracing::warn!("Invalid control message from '{}': {}", peer_id, e);
@@ -1873,6 +2326,8 @@ impl ConnectionManager {
                     if let Some(session) = &conn.kcp_session {
                         if let Err(e) = session.input_wire(data) {
                             tracing::warn!("KCP input error from {}: {}", peer_id, e);
+                        } else {
+                            session.stats.touch_recv_time();
                         }
                         while let Some(d) = session.recv() {
                             result.push((peer_id.clone(), d));
@@ -1890,6 +2345,8 @@ impl ConnectionManager {
                         if session.conv_id() == conv_id {
                             if let Err(e) = session.input_wire(data) {
                                 tracing::warn!("KCP input error from {}: {}", peer_id, e);
+                            } else {
+                                session.stats.touch_recv_time();
                             }
                             while let Some(d) = session.recv() {
                                 result.push((peer_id.clone(), d));
@@ -1924,10 +2381,16 @@ impl ConnectionManager {
                             }
                         }
                         if session_matched {
+                            let mut any_ok = false;
                             for pkt in decoded_pkts {
                                 if let Err(e) = session.input(&pkt) {
                                     tracing::warn!("KCP input error from {}: {}", peer_id, e);
+                                } else {
+                                    any_ok = true;
                                 }
+                            }
+                            if any_ok {
+                                session.stats.touch_recv_time();
                             }
                             while let Some(d) = session.recv() {
                                 result.push((peer_id.clone(), d));
@@ -1983,10 +2446,16 @@ impl ConnectionManager {
                         }
                     }
                     if session_matched {
+                        let mut any_ok = false;
                         for pkt in decoded_pkts {
                             if let Err(e) = session.input(&pkt) {
                                 tracing::warn!("KCP input error from {}: {}", peer_id, e);
+                            } else {
+                                any_ok = true;
                             }
+                        }
+                        if any_ok {
+                            session.stats.touch_recv_time();
                         }
                         while let Some(d) = session.recv() {
                             result.push((peer_id.clone(), d));
@@ -2034,6 +2503,8 @@ impl ConnectionManager {
                     if let Some(session) = &conn.kcp_session {
                         if let Err(e) = session.input_wire(inner) {
                             tracing::warn!("KCP input via TURN for '{}': {}", peer_id, e);
+                        } else {
+                            session.stats.touch_recv_time();
                         }
                         while let Some(d) = session.recv() {
                             result.push((peer_id.clone(), d));
@@ -2087,6 +2558,305 @@ impl ConnectionManager {
                     );
                 }
             }
+        }
+    }
+
+    // =========================================================================
+    // Health monitoring & auto-reconnect
+    // =========================================================================
+
+    /// Start a background task that periodically checks connection health,
+    /// sends keepalive probes, and triggers reconnection for dead connections.
+    fn start_health_monitor(self: &Arc<Self>) {
+        let manager = Arc::downgrade(self);
+        let keepalive_interval = self.config.keepalive_interval;
+        let dead_timeout = self.config.dead_timeout;
+        // Check at half the keepalive interval for timely detection
+        let check_interval = keepalive_interval / 2;
+
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(check_interval);
+            loop {
+                interval.tick().await;
+                let manager = match manager.upgrade() {
+                    Some(m) => m,
+                    None => return, // Manager dropped, exit
+                };
+                if manager.shutting_down.load(Relaxed) {
+                    return;
+                }
+                manager.health_check(keepalive_interval, dead_timeout).await;
+            }
+        });
+        *self.health_task.lock() = Some(handle);
+    }
+
+    /// Check all active connections for health, send keepalives, detect dead.
+    async fn health_check(
+        self: &Arc<Self>,
+        keepalive_interval: Duration,
+        dead_timeout: Duration,
+    ) {
+        enum HealthAction {
+            SendKeepalive(Arc<KcpSession>),
+            Dead,
+        }
+
+        // Collect actions under a single short lock
+        let peer_actions: Vec<(String, HealthAction)> = {
+            let connections = self.connections.lock();
+            connections.iter().filter_map(|(peer_id, conn)| {
+                // Only monitor active connections
+                if conn.state != ConnectionState::Connected
+                    && conn.state != ConnectionState::Relayed
+                {
+                    return None;
+                }
+                let session = conn.kcp_session.as_ref()?;
+                let ms_since_recv = session.stats.ms_since_last_recv();
+                let dead_ms = dead_timeout.as_millis() as u64;
+                let keepalive_ms = keepalive_interval.as_millis() as u64;
+
+                if ms_since_recv >= dead_ms {
+                    Some((peer_id.clone(), HealthAction::Dead))
+                } else if ms_since_recv >= keepalive_ms {
+                    Some((peer_id.clone(), HealthAction::SendKeepalive(session.clone())))
+                } else {
+                    None
+                }
+            }).collect()
+        };
+        // Lock released — safe to call send() and initiate_reconnect()
+
+        for (peer_id, action) in peer_actions {
+            match action {
+                HealthAction::SendKeepalive(session) => {
+                    let ping = negotiation::build_keepalive_ping();
+                    let _ = self.send_control_raw(&session, &ping);
+                    tracing::trace!("Sent keepalive ping to '{}'", peer_id);
+                }
+                HealthAction::Dead => {
+                    tracing::warn!(
+                        "Connection to '{}' dead (no data for {:?}), initiating reconnect",
+                        peer_id, dead_timeout
+                    );
+                    self.initiate_reconnect(&peer_id).await;
+                }
+            }
+        }
+    }
+
+    /// Initiate automatic reconnection to a peer whose connection has died.
+    async fn initiate_reconnect(self: &Arc<Self>, peer_id: &str) {
+        if self.shutting_down.load(Relaxed) {
+            return;
+        }
+        if !self.config.auto_reconnect {
+            self.disconnect(peer_id);
+            return;
+        }
+
+        // Check and increment reconnection attempts
+        let attempt = {
+            let mut rs = self.reconnect_state.lock();
+            let state = rs.entry(peer_id.to_string()).or_insert(ReconnectState {
+                attempts: 0,
+                was_connected: true,
+            });
+            state.attempts += 1;
+            state.attempts
+        };
+
+        if attempt > self.config.max_reconnect_attempts {
+            tracing::warn!(
+                "Max reconnect attempts ({}) reached for '{}', disconnecting",
+                self.config.max_reconnect_attempts, peer_id
+            );
+            self.reconnect_state.lock().remove(peer_id);
+            self.disconnect(peer_id);
+            return;
+        }
+
+        // Check that signaling is available
+        let has_signaling = self.signaling_tx.lock().is_some();
+        if !has_signaling {
+            tracing::warn!(
+                "Cannot reconnect to '{}': signaling is down, waiting for signaling recovery",
+                peer_id
+            );
+            // Don't disconnect — signaling reconnect may restore it
+            return;
+        }
+
+        // Clean up old connection state, preserving reconnect metadata
+        {
+            let mut connections = self.connections.lock();
+            if let Some(conn) = connections.get_mut(peer_id) {
+                if let Some(h) = conn.punch_task.take() {
+                    h.abort();
+                }
+                if let Some(h) = conn.p2p_retry_task.take() {
+                    h.abort();
+                }
+                if let Some(session) = conn.kcp_session.take() {
+                    self.conv_id_index.lock().remove(&session.conv_id());
+                }
+                conn.probe_tx = None;
+                conn.candidate_tx = None;
+                conn.local_candidates.clear();
+                conn.remote_candidates.clear();
+                conn.answer_received = false;
+                conn.turn_allocation = None;
+                conn.turn_channel = None;
+                conn.remote_addr = None;
+                conn.state = ConnectionState::Reconnecting;
+            } else {
+                return;
+            }
+        }
+
+        self.notify_state(peer_id, ConnectionState::Reconnecting);
+        tracing::info!(
+            "Reconnect attempt {}/{} for '{}'",
+            attempt, self.config.max_reconnect_attempts, peer_id
+        );
+
+        // Generate new session and send ConnectRequest
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let session_hash = punch::compute_session_hash(&session_id);
+
+        {
+            let signaling = self.signaling_tx.lock();
+            if let Some(signaling) = signaling.as_ref() {
+                if signaling.send(SignalingMessage::ConnectRequest(ConnectRequestPayload {
+                    target_peer_id: peer_id.to_string(),
+                    session_id: session_id.clone(),
+                })).is_err() {
+                    tracing::warn!("Failed to send ConnectRequest for reconnect to '{}'", peer_id);
+                    return;
+                }
+            } else {
+                return;
+            }
+        }
+
+        // Update PeerConnection with new session info
+        {
+            let mut connections = self.connections.lock();
+            if let Some(conn) = connections.get_mut(peer_id) {
+                conn.session_id = session_id;
+                conn.session_hash = session_hash;
+                conn.is_initiator = true;
+                conn.reverse_attempted = false;
+                conn.state = ConnectionState::Gathering;
+            }
+        }
+
+        self.notify_state(peer_id, ConnectionState::Gathering);
+
+        // Follow the standard connection flow
+        if let Err(e) = self.gather_and_send_candidates(peer_id).await {
+            tracing::error!("Reconnect candidate gathering failed for '{}': {}", peer_id, e);
+            return;
+        }
+        self.spawn_reflexive_gathering(peer_id);
+        self.try_start_punching(peer_id).await;
+        self.spawn_gathering_timeout(peer_id);
+    }
+
+    /// Called when the signaling WebSocket connection is lost.
+    /// Attempts reconnection with exponential backoff.
+    async fn on_signaling_lost(self: &Arc<Self>) {
+        if self.shutting_down.load(Relaxed) {
+            return;
+        }
+
+        // Clear old sender so health monitor knows signaling is down
+        *self.signaling_tx.lock() = None;
+        if let Some(h) = self.signaling_io_task.lock().take() {
+            h.abort();
+        }
+
+        let peer_id = match self.peer_id.lock().clone() {
+            Some(id) => id,
+            None => return, // Never registered
+        };
+
+        let max_attempts = 10u32;
+        for attempt in 1..=max_attempts {
+            if self.shutting_down.load(Relaxed) {
+                tracing::info!("Manager shutting down, aborting signaling reconnection");
+                return;
+            }
+
+            // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s, 30s, ...
+            let delay = Duration::from_secs(
+                (1u64 << (attempt - 1).min(4)).min(30)
+            );
+            tracing::info!(
+                "Signaling reconnect attempt {}/{} in {:?}",
+                attempt, max_attempts, delay
+            );
+            tokio::time::sleep(delay).await;
+
+            if self.shutting_down.load(Relaxed) {
+                return;
+            }
+
+            // Try to connect and re-register
+            match p2p_signaling_client::SignalingClient::connect(&self.config.signaling_url).await {
+                Ok(mut client) => {
+                    match client.register(&peer_id).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                "Signaling reconnected and re-registered as '{}'",
+                                peer_id
+                            );
+                            let (sender, receiver, io_task) = client.into_parts();
+                            *self.signaling_tx.lock() = Some(sender);
+                            *self.signaling_io_task.lock() = io_task;
+
+                            // Start a new signaling handler (this task will then exit)
+                            self.start_signaling_handler(receiver);
+
+                            // After signaling is restored, attempt to reconnect any
+                            // peers that were waiting for signaling
+                            let peers_to_reconnect: Vec<String> = {
+                                let connections = self.connections.lock();
+                                connections.iter()
+                                    .filter(|(_, c)| c.state == ConnectionState::Reconnecting
+                                        || c.state == ConnectionState::Connected
+                                        || c.state == ConnectionState::Relayed)
+                                    .filter(|(_, c)| c.kcp_session.is_none())
+                                    .map(|(pid, _)| pid.clone())
+                                    .collect()
+                            };
+                            for pid in peers_to_reconnect {
+                                self.initiate_reconnect(&pid).await;
+                            }
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::warn!("Signaling re-registration failed: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Signaling reconnect failed: {}", e);
+                }
+            }
+        }
+
+        tracing::error!(
+            "Signaling reconnection failed after {} attempts, disconnecting all peers",
+            max_attempts
+        );
+        // Give up — disconnect all peers
+        let peer_ids: Vec<String> = {
+            self.connections.lock().keys().cloned().collect()
+        };
+        for pid in peer_ids {
+            self.disconnect(&pid);
         }
     }
 

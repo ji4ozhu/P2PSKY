@@ -217,6 +217,61 @@ pub extern "C" fn p2p_register(handle: *mut P2pHandle, peer_id: *const c_char) -
     }
 }
 
+/// Set or clear TURN server configuration dynamically.
+///
+/// Can be called at any time after `p2p_register()`. New connections will use
+/// the updated TURN config. Existing connections are not affected.
+///
+/// To enable TURN: pass non-NULL `server`, `username`, and `password`.
+/// To disable TURN: pass NULL for `server` (username and password are ignored).
+///
+/// The strings are copied internally; the caller may free them after this call returns.
+#[no_mangle]
+pub extern "C" fn p2p_set_turn_server(
+    handle: *mut P2pHandle,
+    server: *const c_char,
+    username: *const c_char,
+    password: *const c_char,
+) -> P2pErrorCode {
+    let inner = match get_inner(handle) {
+        Some(i) => i,
+        None => return P2pErrorCode::NotInitialized,
+    };
+
+    let turn_config = if server.is_null() {
+        None
+    } else {
+        let server_addr = match unsafe_cstr_to_string(server) {
+            Some(s) => s,
+            None => return P2pErrorCode::InvalidArgument,
+        };
+        let user = match unsafe_cstr_to_string(username) {
+            Some(s) => s,
+            None => return P2pErrorCode::InvalidArgument,
+        };
+        let pass = match unsafe_cstr_to_string(password) {
+            Some(s) => s,
+            None => return P2pErrorCode::InvalidArgument,
+        };
+        Some(TurnConfig {
+            server_addr,
+            username: user,
+            password: pass,
+        })
+    };
+
+    let manager = {
+        let guard = inner.manager.lock();
+        match guard.as_ref() {
+            Some(m) => m.clone(),
+            None => return P2pErrorCode::NotInitialized,
+        }
+    };
+
+    manager.set_turn_config(turn_config);
+    P2pErrorCode::Ok
+}
+
 /// Set callback for connection state changes.
 #[no_mangle]
 pub extern "C" fn p2p_set_state_callback(
@@ -263,10 +318,19 @@ pub extern "C" fn p2p_set_incoming_callback(
 }
 
 /// Initiate a connection to a remote peer.
+///
+/// `punch_timeout_ms`: per-connect hole punch timeout in milliseconds.
+///   0 = use the default (15s). If punching doesn't succeed within this time,
+///   the connection falls back to TURN relay (if configured).
+///
+/// `turn_only`: if true, skip hole punching entirely and go straight to TURN relay.
+///   Candidate gathering still runs (TURN allocation is needed), but no probes are sent.
 #[no_mangle]
 pub extern "C" fn p2p_connect(
     handle: *mut P2pHandle,
     remote_peer_id: *const c_char,
+    punch_timeout_ms: u32,
+    turn_only: bool,
 ) -> P2pErrorCode {
     let inner = match get_inner(handle) {
         Some(i) => i,
@@ -278,6 +342,12 @@ pub extern "C" fn p2p_connect(
         None => return P2pErrorCode::InvalidArgument,
     };
 
+    let punch_timeout = if punch_timeout_ms == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_millis(punch_timeout_ms as u64))
+    };
+
     let manager_lock = inner.manager.lock();
     let manager = match manager_lock.as_ref() {
         Some(m) => m.clone(),
@@ -285,7 +355,9 @@ pub extern "C" fn p2p_connect(
     };
     drop(manager_lock);
 
-    let result = inner.runtime.block_on(async { manager.connect(&remote_id).await });
+    let result = inner.runtime.block_on(async {
+        manager.connect(&remote_id, punch_timeout, turn_only).await
+    });
 
     match result {
         Ok(()) => P2pErrorCode::Ok,
@@ -611,6 +683,47 @@ pub extern "C" fn p2p_enable_dns_disguise(
     }
 }
 
+// === P2P Retry Control API ===
+
+/// Enable or disable automatic P2P retry for a peer currently using TURN relay.
+///
+/// When enabled, the library periodically attempts hole punching (every 5 seconds)
+/// while the connection is in Relayed state. If a direct P2P path is found, the
+/// session seamlessly switches from TURN relay to direct UDP without interruption.
+///
+/// This is a per-peer dynamic toggle — can be called at any time after `p2p_connect()`.
+/// If called before the connection enters Relayed state, the flag is stored and the
+/// retry loop starts automatically once TURN relay is established.
+#[no_mangle]
+pub extern "C" fn p2p_enable_p2p_retry(
+    handle: *mut P2pHandle,
+    remote_peer_id: *const c_char,
+    enabled: bool,
+) -> P2pErrorCode {
+    let inner = match get_inner(handle) {
+        Some(i) => i,
+        None => return P2pErrorCode::NotInitialized,
+    };
+
+    let remote_id = match unsafe_cstr_to_string(remote_peer_id) {
+        Some(s) => s,
+        None => return P2pErrorCode::InvalidArgument,
+    };
+
+    let manager = {
+        let guard = inner.manager.lock();
+        match guard.as_ref() {
+            Some(m) => m.clone(),
+            None => return P2pErrorCode::NotInitialized,
+        }
+    };
+
+    match manager.enable_p2p_retry(&remote_id, enabled) {
+        Ok(()) => P2pErrorCode::Ok,
+        Err(_) => P2pErrorCode::NotConnected,
+    }
+}
+
 // === Internal helpers ===
 
 fn get_inner(handle: *mut P2pHandle) -> Option<&'static P2pInner> {
@@ -647,16 +760,6 @@ fn convert_config(c: &P2pConfigC) -> Option<P2pConfig> {
         vec![unsafe_cstr_to_string(c.stun_server)?]
     };
 
-    let turn_server = if !c.turn_server.is_null() && !c.turn_username.is_null() && !c.turn_password.is_null() {
-        Some(TurnConfig {
-            server_addr: unsafe_cstr_to_string(c.turn_server)?,
-            username: unsafe_cstr_to_string(c.turn_username)?,
-            password: unsafe_cstr_to_string(c.turn_password)?,
-        })
-    } else {
-        None
-    };
-
     let kcp_mode = match c.kcp_mode {
         0 => KcpMode::Normal,
         1 => KcpMode::Fast,
@@ -667,7 +770,6 @@ fn convert_config(c: &P2pConfigC) -> Option<P2pConfig> {
     Some(P2pConfig {
         signaling_url,
         stun_servers,
-        turn_server,
         enable_ipv6: c.enable_ipv6,
         kcp_mode,
         ..Default::default()

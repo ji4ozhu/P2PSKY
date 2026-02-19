@@ -1,7 +1,16 @@
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::OnceLock;
 use std::time::Instant;
 
-use portable_atomic::{AtomicU32, AtomicU64};
+use portable_atomic::{AtomicI64, AtomicU32, AtomicU64};
+
+/// Monotonic milliseconds since process start (shared epoch).
+/// Used for lock-free timestamp tracking across threads.
+fn elapsed_millis_i64() -> i64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let epoch = EPOCH.get_or_init(Instant::now);
+    epoch.elapsed().as_millis() as i64
+}
 
 /// Lock-free connection statistics, updated atomically by send/recv IO threads.
 ///
@@ -57,6 +66,11 @@ pub struct ConnectionStats {
     /// Packets waiting in receive buffer
     pub recv_queue_len: AtomicU32,
 
+    // --- Health monitoring ---
+    /// Monotonic timestamp (ms since process start) of the last received packet.
+    /// Updated atomically by recv path; read by health monitor.
+    pub last_recv_ms: AtomicI64,
+
     // --- Connection metadata ---
     /// Whether currently relayed through TURN
     pub is_relayed: portable_atomic::AtomicBool,
@@ -100,6 +114,7 @@ impl ConnectionStats {
             send_queue_len: AtomicU32::new(0),
             recv_queue_len: AtomicU32::new(0),
             is_relayed: portable_atomic::AtomicBool::new(false),
+            last_recv_ms: AtomicI64::new(elapsed_millis_i64()),
             fec_enabled: portable_atomic::AtomicBool::new(false),
             encryption_enabled: portable_atomic::AtomicBool::new(false),
             dns_disguise_enabled: portable_atomic::AtomicBool::new(false),
@@ -139,6 +154,23 @@ impl ConnectionStats {
 
     pub fn record_fec_recovery(&self) {
         self.fec_recoveries.fetch_add(1, Relaxed);
+    }
+
+    /// Update the last-received timestamp to "now".
+    /// Called from recv path after successful KCP input.
+    pub fn touch_recv_time(&self) {
+        self.last_recv_ms.store(elapsed_millis_i64(), Relaxed);
+    }
+
+    /// Milliseconds elapsed since the last received packet.
+    /// Returns 0 if no packet has ever been received.
+    pub fn ms_since_last_recv(&self) -> u64 {
+        let last = self.last_recv_ms.load(Relaxed);
+        if last == 0 {
+            return 0;
+        }
+        let now = elapsed_millis_i64();
+        (now - last).max(0) as u64
     }
 
     pub fn update_rtt(&self, rtt_us: u32) {
