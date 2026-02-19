@@ -19,6 +19,7 @@ Rust core with C ABI exports. Works with C/C++/C#/Python/Java/Swift.
 | **Auto Negotiation** | Toggling FEC / encryption / disguise auto-notifies the remote peer — 自动配置协商，零丢包切换 |
 | **IPv4/IPv6 Dual Stack** | Independent v4/v6 sockets, compatible with all network environments — 双栈支持 |
 | **TURN→P2P Auto Retry** | Periodically re-attempts direct P2P while relayed — 中继状态下自动重试直连 |
+| **Auto Reconnect** | Keepalive health monitoring + automatic P2P & signaling reconnection on network disruption — 心跳健康检测 + 网络波动自动重连 |
 
 ---
 
@@ -187,25 +188,61 @@ Full documentation: [docs/API.md](docs/API.md)
 
 | Platform | Target | Artifact |
 |----------|--------|----------|
-| Windows x86_64 | `x86_64-pc-windows-msvc` | `p2p.dll` / `p2p.lib` |
-| macOS ARM64 | `aarch64-apple-darwin` | `libp2p.dylib` / `libp2p.a` |
+| Windows x86 | `i686-pc-windows-msvc` | `p2p.dll` / `p2p.lib` |
+| Windows x64 | `x86_64-pc-windows-msvc` | `p2p.dll` / `p2p.lib` |
+| Windows ARM64 | `aarch64-pc-windows-msvc` | `p2p.dll` / `p2p.lib` |
 | Linux x86_64 | `x86_64-unknown-linux-gnu` | `libp2p.so` / `libp2p.a` |
 | Linux ARM64 | `aarch64-unknown-linux-gnu` | `libp2p.so` / `libp2p.a` |
-| Android ARM64 | `aarch64-linux-android` | `libp2p.so` |
-| iOS ARM64 | `aarch64-apple-ios` | `libp2p.a` |
+| Android ARM64 | `aarch64-linux-android` | `libp2p.so` / `libp2p.a` |
+| Android x86 | `i686-linux-android` | `libp2p.so` / `libp2p.a` |
+| iOS ARM64 (Device) | `aarch64-apple-ios` | `libp2p.a` |
+| iOS ARM64 (Simulator) | `aarch64-apple-ios-sim` | `libp2p.a` |
+| macOS ARM64 | `aarch64-apple-darwin` | `libp2p.dylib` / `libp2p.a` |
+| macOS x86_64 | `x86_64-apple-darwin` | `libp2p.dylib` / `libp2p.a` |
+| macOS Universal | ARM64 + x86_64 (lipo) | `libp2p.dylib` / `libp2p.a` |
+| iOS XCFramework | Device + Simulator | `libp2p.xcframework` |
 
-### Cross-compilation / 交叉编译
+### One-click Build / 一键编译
+
+**Windows / Linux / Android** (run on Windows):
+
+```bat
+scripts\build_all.bat
+```
+
+Builds 7 targets: Windows x86/x64/ARM64, Linux x86_64/ARM64, Android ARM64/x86.
+Requires: Visual Studio 2022, cargo-zigbuild + Zig, Android NDK.
+
+**iOS / macOS** (run on Mac):
 
 ```bash
-# Android
-cargo install cargo-ndk
-cargo ndk -t arm64-v8a build --release -p p2p-ffi
+./scripts/build_apple.sh           # All (iOS + macOS + Universal)
+./scripts/build_apple.sh ios       # iOS only
+./scripts/build_apple.sh macos     # macOS only
+```
 
-# iOS
+Builds 4 targets + Universal Binary (lipo) + iOS XCFramework.
+Requires: Xcode 14+.
+
+All artifacts output to `release/` directory. See [scripts/BUILD_ENV.md](scripts/BUILD_ENV.md) for full environment setup.
+
+### Manual Cross-compilation / 手动交叉编译
+
+```bash
+# Windows x64
+cargo build --release -p p2p-ffi --target x86_64-pc-windows-msvc
+
+# Linux x86_64 (requires cargo-zigbuild)
+cargo zigbuild --release -p p2p-ffi --target x86_64-unknown-linux-gnu
+
+# Android ARM64 (requires NDK, see .cargo/config.toml for linker)
+cargo build --release -p p2p-ffi --target aarch64-linux-android
+
+# iOS ARM64 (Mac only)
 cargo build --release -p p2p-ffi --target aarch64-apple-ios
 
-# Linux ARM64
-cross build --release -p p2p-ffi --target aarch64-unknown-linux-gnu
+# macOS ARM64 (Mac only)
+cargo build --release -p p2p-ffi --target aarch64-apple-darwin
 ```
 
 ---
@@ -263,9 +300,9 @@ kcp_p2p_stun/
 │   ├── API.md                  Full C API reference + multi-language examples
 │   └── BUILD.md                Build guide for all platforms
 └── scripts/
-    ├── build_all.sh            Build all platforms
-    ├── build_android.sh        Android build
-    └── build_ios.sh            iOS build
+    ├── build_all.bat           Windows/Linux/Android one-click build (7 targets)
+    ├── build_apple.sh          iOS/macOS one-click build (4 targets + Universal)
+    └── BUILD_ENV.md            Build environment setup guide
 ```
 
 ---
@@ -295,7 +332,7 @@ Features: peer registration, connection request relay, candidate trickle, ping/p
 ## Build / 编译
 
 ```bash
-# Build FFI library (release)
+# Build FFI library (release, current platform)
 cargo build --release -p p2p-ffi
 
 # Build entire workspace
@@ -306,6 +343,41 @@ cargo test --workspace
 
 # Lint
 cargo clippy --workspace -- -W clippy::all
+```
+
+### All-platform Build / 全平台编译
+
+```bat
+:: Windows / Linux / Android (7 targets)
+scripts\build_all.bat
+
+:: iOS / macOS (4 targets + Universal Binary + XCFramework)
+./scripts/build_apple.sh
+```
+
+Release directory structure / 产物目录:
+
+```
+release/
+├── p2p.h                              C header (cbindgen)
+├── Windows/release/
+│   ├── x86/        p2p.dll + p2p.lib
+│   ├── x64/        p2p.dll + p2p.lib
+│   └── aarch64/    p2p.dll + p2p.lib
+├── Linux/release/
+│   ├── x86_64/     libp2p.so + libp2p.a
+│   └── aarch64/    libp2p.so + libp2p.a
+├── Android/release/
+│   ├── aarch64/    libp2p.so + libp2p.a
+│   └── x86/        libp2p.so + libp2p.a
+├── iOS/release/
+│   ├── aarch64/         libp2p.a  (Device)
+│   ├── aarch64-sim/     libp2p.a  (Simulator)
+│   └── universal/       libp2p.xcframework  (Device + Simulator)
+└── macOS/release/
+    ├── aarch64/         libp2p.dylib + libp2p.a  (Apple Silicon)
+    ├── x86_64/          libp2p.dylib + libp2p.a  (Intel)
+    └── universal/       libp2p.dylib + libp2p.a  (Universal Binary)
 ```
 
 ### Windows Demo
