@@ -82,6 +82,8 @@ Alice                     信令服务器                    Bob
 
 开启/关闭某一层时，库通过 KCP 内带控制消息自动通知对端，并使用 Transition Mode 短暂接受新旧两种格式，确保切换过程零丢包。
 
+> **重要：只需在一端启用即可。** FEC、加密、DNS 伪装等功能只需在连接的任意一端调用启用 API，对端会通过控制消息自动接收并适配。**请勿两端同时启用**，否则双方同时发起协商会导致冲突错误。
+
 ## FEC 自适应策略
 
 | 丢包率 | 数据:冗余 | 带宽开销 |
@@ -124,10 +126,11 @@ int main() {
     p2p_set_state_callback(h, on_state, NULL);
     p2p_register(h, "alice");
 
-    p2p_connect(h, "bob");
+    p2p_connect(h, "bob", 0, false);  // 0=默认超时15s, false=正常打洞
     p2p_send(h, "bob", (const uint8_t*)"Hello", 5);
 
     // 开启加密（自动协商密钥）
+    // 注意：只需在一端调用，对端会自动协商适配，请勿两端同时调用
     p2p_enable_encryption(h, "bob");
 
     p2p_shutdown(h);

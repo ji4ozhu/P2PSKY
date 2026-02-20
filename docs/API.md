@@ -216,6 +216,8 @@ P2pErrorCode p2p_get_stats(P2pHandle* handle,
 
 所有功能开关会自动通过 KCP 控制消息与对端协商，无需手动同步。
 
+> **重要：只需在一端调用即可。** FEC、加密、DNS 伪装只需在连接的任意一端启用，对端会通过控制消息自动接收并适配。**请勿两端同时启用**，否则双方同时发起协商会导致冲突错误。
+
 #### `p2p_set_turn_server`
 ```c
 P2pErrorCode p2p_set_turn_server(P2pHandle* handle,
@@ -236,20 +238,21 @@ P2pErrorCode p2p_enable_fec(P2pHandle* handle,
                              const char* remote_peer_id,
                              bool enabled);
 ```
-开启/关闭 FEC 前向纠错。冗余比例根据丢包率自动调整。
+开启/关闭 FEC 前向纠错。冗余比例根据丢包率自动调整。只需在一端调用，对端自动适配。请勿两端同时调用。
 
 #### `p2p_enable_encryption`
 ```c
 P2pErrorCode p2p_enable_encryption(P2pHandle* handle,
                                     const char* remote_peer_id);
 ```
-开启 ChaCha20-Poly1305 加密。密钥自动随机生成并通过控制消息发送给对端。
+开启 ChaCha20-Poly1305 加密。密钥自动随机生成并通过控制消息发送给对端。只需在一端调用，对端自动适配。请勿两端同时调用。
 
 #### `p2p_disable_encryption`
 ```c
 P2pErrorCode p2p_disable_encryption(P2pHandle* handle,
                                      const char* remote_peer_id);
 ```
+关闭加密。同样只需在一端调用，对端自动适配。
 
 #### `p2p_enable_dns_disguise`
 ```c
@@ -257,6 +260,7 @@ P2pErrorCode p2p_enable_dns_disguise(P2pHandle* handle,
                                       const char* remote_peer_id,
                                       bool enabled);
 ```
+开启/关闭 DNS 协议伪装。只需在一端调用，对端自动适配。请勿两端同时调用。
 
 #### `p2p_enable_p2p_retry`
 ```c
@@ -319,6 +323,7 @@ int main() {
     const char* msg = "Hello";
     p2p_send(h, "bob", (const uint8_t*)msg, strlen(msg));
 
+    // 注意：以下功能开关只需在一端调用，对端自动协商适配，请勿两端同时调用
     p2p_enable_fec(h, "bob", true);
     p2p_enable_encryption(h, "bob");
     p2p_enable_p2p_retry(h, "bob", true);  // Relayed 时自动重试 P2P
@@ -558,6 +563,7 @@ lib.p2p_set_receive_callback(h, _recv_cb, None)
 lib.p2p_register(h, b"my_id")
 lib.p2p_connect(h, b"peer_id", 0, False)  # 0 = 默认超时, False = 正常打洞
 lib.p2p_send(h, b"peer_id", b"Hello from Python!", 18)
+# 注意：以下功能开关只需在一端调用，对端自动协商适配，请勿两端同时调用
 lib.p2p_enable_p2p_retry(h, b"peer_id", True)  # 开启 P2P 自动重试
 lib.p2p_shutdown(h)
 ```
@@ -632,6 +638,7 @@ p2p_connect(h, "peer_id", 0, false)  // 默认超时, 正常打洞
 let data: [UInt8] = Array("Hello from iOS!".utf8)
 p2p_send(h, "peer_id", data, UInt32(data.count))
 
+// 注意：以下功能开关只需在一端调用，对端自动协商适配，请勿两端同时调用
 p2p_enable_encryption(h, "peer_id")
 p2p_enable_p2p_retry(h, "peer_id", true)  // Relayed 时自动重试 P2P
 p2p_shutdown(h)

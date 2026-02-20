@@ -17,9 +17,9 @@
  *   send <peer_id> <message>   - Send a text message
  *   file <peer_id> <path>      - Send a file
  *   stats <peer_id>            - Show connection statistics
- *   fec <peer_id> on|off       - Toggle FEC
- *   encrypt <peer_id> on|off   - Toggle encryption
- *   dns <peer_id> on|off       - Toggle DNS disguise
+ *   fec <peer_id> on|off       - Toggle FEC (only one side needed)
+ *   encrypt <peer_id> on|off   - Toggle encryption (only one side needed)
+ *   dns <peer_id> on|off       - Toggle DNS disguise (only one side needed)
  *   retry <peer_id> on|off     - Toggle P2P retry while relayed
  *   help                       - Show commands
  *   quit                       - Exit
@@ -676,9 +676,9 @@ static void print_help() {
     printf("  file <peer_id> <path>      Send a file\n");
     printf("  stats <peer_id>            Show connection statistics\n");
     printf("  list                       Show all connections and states\n");
-    printf("  fec <peer_id> on|off       Toggle FEC\n");
-    printf("  encrypt <peer_id> on|off   Toggle encryption\n");
-    printf("  dns <peer_id> on|off       Toggle DNS disguise\n");
+    printf("  fec <peer_id> on|off       Toggle FEC (only one side needed)\n");
+    printf("  encrypt <peer_id> on|off   Toggle encryption (only one side needed)\n");
+    printf("  dns <peer_id> on|off       Toggle DNS disguise (only one side needed)\n");
     printf("  retry <peer_id> on|off     Toggle P2P retry while relayed\n");
     printf("  turn <server> <user> <pass> Set TURN server\n");
     printf("  turn off                    Disable TURN\n");
@@ -917,6 +917,8 @@ int main(int argc, char* argv[]) {
             print_stats(arg1.c_str());
         }
         // ---- fec ----
+        // 注意：FEC/加密/DNS伪装 只需在一端启用，对端会自动协商适配。
+        //       请勿两端同时调用，否则双方同时发起协商会导致冲突错误。
         else if (cmd == "fec") {
             if (arg1.empty() || arg2.empty()) {
                 log_warn("Usage: fec <peer_id> on|off");
@@ -929,7 +931,7 @@ int main(int argc, char* argv[]) {
             else
                 log_ok("FEC %s for [%s]", enable ? "enabled" : "disabled", arg1.c_str());
         }
-        // ---- encrypt ----
+        // ---- encrypt (只需一端调用，对端自动适配) ----
         else if (cmd == "encrypt" || cmd == "enc") {
             if (arg1.empty() || arg2.empty()) {
                 log_warn("Usage: encrypt <peer_id> on|off");
@@ -947,7 +949,7 @@ int main(int argc, char* argv[]) {
             else
                 log_ok("Encryption %s for [%s]", enable ? "enabled" : "disabled", arg1.c_str());
         }
-        // ---- dns disguise ----
+        // ---- dns disguise (只需一端调用，对端自动适配) ----
         else if (cmd == "dns") {
             if (arg1.empty() || arg2.empty()) {
                 log_warn("Usage: dns <peer_id> on|off");
