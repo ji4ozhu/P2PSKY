@@ -148,6 +148,12 @@ P2pErrorCode p2p_register(P2pHandle* handle, const char* peer_id);
 ```
 连接信令服务器并注册 Peer ID。创建连接管理器，绑定 UDP socket，启动接收循环。必须在 `p2p_connect` 之前调用。
 
+#### `p2p_unregister`
+```c
+P2pErrorCode p2p_unregister(P2pHandle* handle);
+```
+断开信令服务器，断开所有 peer 连接，销毁连接管理器——但保留 `p2p_init()` 创建的句柄和运行时。调用后可再次调用 `p2p_register()` 重新连接信令服务器。
+
 ### 回调设置
 
 #### `p2p_set_state_callback`
@@ -202,7 +208,26 @@ P2pErrorCode p2p_send(P2pHandle* handle,
 P2pErrorCode p2p_disconnect(P2pHandle* handle, const char* remote_peer_id);
 ```
 
+#### `p2p_disconnect_all`
+```c
+P2pErrorCode p2p_disconnect_all(P2pHandle* handle);
+```
+断开所有 peer 连接，但保留信令服务器连接和连接管理器。断开后仍可继续调用 `p2p_connect()` 发起新连接。
+
 ### 统计
+
+#### `p2p_get_peers`
+```c
+P2pErrorCode p2p_get_peers(P2pHandle* handle,
+                            char* buf,
+                            uint32_t buf_len,
+                            uint32_t* count_out);
+```
+获取当前已连接（Connected/Relayed）的 peer 列表。
+
+- `count_out`：接收已连接 peer 数量。
+- `buf`：接收 `'\n'` 分隔的 peer ID 列表（null 结尾）。传 NULL 则仅返回数量。
+- `buf_len`：缓冲区大小。空间不足时返回 `BufferTooSmall`。
 
 #### `p2p_get_stats`
 ```c
@@ -332,6 +357,10 @@ int main() {
     p2p_get_stats(h, "bob", &stats);
     printf("RTT: %.1f ms, Loss: %.1f%%\n", stats.rtt_ms, stats.loss_percent);
 
+    // 断开信令但保留句柄（之后可再次 p2p_register）
+    // p2p_unregister(h);
+
+    // 彻底释放所有资源，句柄不可再用
     p2p_shutdown(h);
 }
 ```
@@ -458,12 +487,17 @@ public static class P2p
     [DllImport(DLL)] public static extern IntPtr p2p_init(ref ConfigC config);
     [DllImport(DLL)] public static extern int p2p_shutdown(IntPtr handle);
     [DllImport(DLL)] public static extern int p2p_register(IntPtr handle, string peer_id);
+    [DllImport(DLL)] public static extern int p2p_unregister(IntPtr handle);
     [DllImport(DLL)] public static extern int p2p_connect(IntPtr handle, string peer_id,
                                                             uint punch_timeout_ms,
                                                             [MarshalAs(UnmanagedType.U1)] bool turn_only);
     [DllImport(DLL)] public static extern int p2p_send(IntPtr handle, string peer_id,
                                                         byte[] data, uint len);
     [DllImport(DLL)] public static extern int p2p_disconnect(IntPtr handle, string peer_id);
+    [DllImport(DLL)] public static extern int p2p_disconnect_all(IntPtr handle);
+    [DllImport(DLL)] public static extern int p2p_get_peers(IntPtr handle,
+                                                              StringBuilder buf, uint buf_len,
+                                                              out uint count_out);
     [DllImport(DLL)] public static extern int p2p_get_stats(IntPtr handle, string peer_id,
                                                              out StatsC stats);
     [DllImport(DLL)] public static extern int p2p_enable_fec(IntPtr handle, string peer_id,
@@ -565,6 +599,11 @@ lib.p2p_connect(h, b"peer_id", 0, False)  # 0 = 默认超时, False = 正常打�
 lib.p2p_send(h, b"peer_id", b"Hello from Python!", 18)
 # 注意：以下功能开关只需在一端调用，对端自动协商适配，请勿两端同时调用
 lib.p2p_enable_p2p_retry(h, b"peer_id", True)  # 开启 P2P 自动重试
+
+# 断开信令但保留句柄（之后可再次 p2p_register）
+# lib.p2p_unregister(h)
+
+# 彻底释放所有资源，句柄不可再用
 lib.p2p_shutdown(h)
 ```
 
@@ -607,9 +646,12 @@ public interface P2pLib extends Library {
     Pointer p2p_init(P2pConfigC config);
     int p2p_shutdown(Pointer h);
     int p2p_register(Pointer h, String peer_id);
+    int p2p_unregister(Pointer h);
     int p2p_connect(Pointer h, String peer_id, int punch_timeout_ms, boolean turn_only);
     int p2p_send(Pointer h, String peer_id, byte[] data, int len);
     int p2p_disconnect(Pointer h, String peer_id);
+    int p2p_disconnect_all(Pointer h);
+    int p2p_get_peers(Pointer h, byte[] buf, int buf_len, int[] count_out);
     int p2p_get_stats(Pointer h, String peer_id, P2pStatsC stats);
     int p2p_enable_fec(Pointer h, String peer_id, boolean on);
     int p2p_enable_encryption(Pointer h, String peer_id);
@@ -641,6 +683,11 @@ p2p_send(h, "peer_id", data, UInt32(data.count))
 // 注意：以下功能开关只需在一端调用，对端自动协商适配，请勿两端同时调用
 p2p_enable_encryption(h, "peer_id")
 p2p_enable_p2p_retry(h, "peer_id", true)  // Relayed 时自动重试 P2P
+
+// 断开信令但保留句柄（之后可再次 p2p_register）
+// p2p_unregister(h)
+
+// 彻底释放所有资源，句柄不可再用
 p2p_shutdown(h)
 ```
 

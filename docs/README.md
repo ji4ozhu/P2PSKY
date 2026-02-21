@@ -133,6 +133,10 @@ int main() {
     // 注意：只需在一端调用，对端会自动协商适配，请勿两端同时调用
     p2p_enable_encryption(h, "bob");
 
+    // 断开信令但保留句柄（之后可再次 p2p_register）
+    // p2p_unregister(h);
+
+    // 彻底释放所有资源，句柄不可再用
     p2p_shutdown(h);
 }
 ```

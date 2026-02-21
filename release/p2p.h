@@ -135,6 +135,13 @@ P2pErrorCode p2p_shutdown(P2pHandle *handle);
 /// Register this peer with the signaling server.
 P2pErrorCode p2p_register(P2pHandle *handle, const char *peer_id);
 
+/// Unregister from the signaling server and clean up all connections.
+///
+/// This disconnects all peers, stops all background tasks, and destroys the
+/// ConnectionManager — but keeps the P2pHandle (and its tokio runtime) alive.
+/// After this call, `p2p_register()` can be called again with the same handle.
+P2pErrorCode p2p_unregister(P2pHandle *handle);
+
 /// Set or clear TURN server configuration dynamically.
 ///
 /// Can be called at any time after `p2p_register()`. New connections will use
@@ -188,6 +195,17 @@ P2pErrorCode p2p_send(P2pHandle *handle,
 /// H1: The manager lock is released before calling disconnect() to prevent
 /// deadlock if the disconnect triggers a state callback that re-enters FFI.
 P2pErrorCode p2p_disconnect(P2pHandle *handle, const char *remote_peer_id);
+
+/// Disconnect all peers but keep the signaling connection alive.
+P2pErrorCode p2p_disconnect_all(P2pHandle *handle);
+
+/// Get the list of connected peers.
+///
+/// Writes '\n'-separated peer IDs into `buf` (null-terminated).
+/// `count_out` receives the number of connected/relayed peers.
+/// If `buf` is NULL, only the count is returned.
+/// Returns `BufferTooSmall` if the buffer is not large enough.
+P2pErrorCode p2p_get_peers(P2pHandle *handle, char *buf, uint32_t buf_len, uint32_t *count_out);
 
 /// Get a human-readable error string.
 const char *p2p_error_string(P2pErrorCode error);

@@ -5,6 +5,14 @@
 
 Rust core with C ABI exports. Works with C/C++/C#/Python/Java/Swift.
 
+
+Dmeo:
+A User: p2p_demo.exe user1
+B User: p2p_demo.exe user2
+
+A User:connect user2
+A User:send user2 hello    [send text]
+A User:file user2 d:\software\xxx.zip    [send file]
 ---
 
 ## Features / 核心功能
@@ -150,6 +158,10 @@ int main() {
     // Enable FEC for lossy networks
     p2p_enable_fec(h, "bob", true);
 
+    // Unregister (keep handle, can re-register later)
+    p2p_unregister(h);
+
+    // Final shutdown
     p2p_shutdown(h);
 }
 ```
@@ -158,13 +170,14 @@ int main() {
 
 ## C API Reference / API 参考
 
-17 exported functions:
+20 exported functions:
 
 | Function | Description |
 |----------|-------------|
 | `p2p_init` | Initialize library, returns opaque handle / 初始化 |
 | `p2p_shutdown` | Shutdown and free all resources / 关闭并释放资源 |
 | `p2p_register` | Register peer ID with signaling server / 注册 |
+| `p2p_unregister` | Unregister and clean up connections, keep handle alive / 注销（保留 handle） |
 | `p2p_set_turn_server` | Set/clear TURN server dynamically / 动态配置 TURN |
 | `p2p_set_state_callback` | Connection state change callback / 状态回调 |
 | `p2p_set_receive_callback` | Data receive callback / 数据接收回调 |
@@ -172,6 +185,8 @@ int main() {
 | `p2p_connect` | Connect to peer (configurable timeout + turn_only) / 连接 |
 | `p2p_send` | Send data to connected peer / 发送数据 |
 | `p2p_disconnect` | Disconnect from peer / 断开连接 |
+| `p2p_disconnect_all` | Disconnect all peers, keep signaling alive / 断开所有连接 |
+| `p2p_get_peers` | Get connected peer list and count / 查询已连接的 peer 列表 |
 | `p2p_get_stats` | Get full connection statistics / 获取统计 |
 | `p2p_error_string` | Human-readable error string / 错误描述 |
 | `p2p_enable_fec` | Toggle FEC per-peer / 开关 FEC |
@@ -301,7 +316,9 @@ kcp_p2p_stun/
 │   └── BUILD.md                Build guide for all platforms
 └── scripts/
     ├── build_all.bat           Windows/Linux/Android one-click build (7 targets)
+    ├── build_all.sh            All-platform build for Unix (6 targets)
     ├── build_apple.sh          iOS/macOS one-click build (4 targets + Universal)
+    ├── build_android.sh        Android standalone build
     └── BUILD_ENV.md            Build environment setup guide
 ```
 
@@ -360,21 +377,21 @@ Release directory structure / 产物目录:
 ```
 release/
 ├── p2p.h                              C header (cbindgen)
-├── Windows/release/
+├── Windows/
 │   ├── x86/        p2p.dll + p2p.lib
 │   ├── x64/        p2p.dll + p2p.lib
 │   └── aarch64/    p2p.dll + p2p.lib
-├── Linux/release/
+├── Linux/
 │   ├── x86_64/     libp2p.so + libp2p.a
 │   └── aarch64/    libp2p.so + libp2p.a
-├── Android/release/
+├── Android/
 │   ├── aarch64/    libp2p.so + libp2p.a
 │   └── x86/        libp2p.so + libp2p.a
-├── iOS/release/
+├── iOS/
 │   ├── aarch64/         libp2p.a  (Device)
 │   ├── aarch64-sim/     libp2p.a  (Simulator)
 │   └── universal/       libp2p.xcframework  (Device + Simulator)
-└── macOS/release/
+└── macOS/
     ├── aarch64/         libp2p.dylib + libp2p.a  (Apple Silicon)
     ├── x86_64/          libp2p.dylib + libp2p.a  (Intel)
     └── universal/       libp2p.dylib + libp2p.a  (Universal Binary)

@@ -17,10 +17,14 @@
  *   send <peer_id> <message>   - Send a text message
  *   file <peer_id> <path>      - Send a file
  *   stats <peer_id>            - Show connection statistics
+ *   peers                      - List connected peers and count
  *   fec <peer_id> on|off       - Toggle FEC (only one side needed)
  *   encrypt <peer_id> on|off   - Toggle encryption (only one side needed)
  *   dns <peer_id> on|off       - Toggle DNS disguise (only one side needed)
  *   retry <peer_id> on|off     - Toggle P2P retry while relayed
+ *   unregister                 - Disconnect signaling, keep handle alive
+ *   register <peer_id>         - Re-register with signaling server
+ *   disconnect_all             - Disconnect all peers, keep signaling
  *   help                       - Show commands
  *   quit                       - Exit
  */
@@ -675,6 +679,7 @@ static void print_help() {
     printf("  send <peer_id> <message>   Send a text message\n");
     printf("  file <peer_id> <path>      Send a file\n");
     printf("  stats <peer_id>            Show connection statistics\n");
+    printf("  peers                      List connected peers and count\n");
     printf("  list                       Show all connections and states\n");
     printf("  fec <peer_id> on|off       Toggle FEC (only one side needed)\n");
     printf("  encrypt <peer_id> on|off   Toggle encryption (only one side needed)\n");
@@ -682,7 +687,10 @@ static void print_help() {
     printf("  retry <peer_id> on|off     Toggle P2P retry while relayed\n");
     printf("  turn <server> <user> <pass> Set TURN server\n");
     printf("  turn off                    Disable TURN\n");
+    printf("  unregister                 Disconnect signaling, keep handle\n");
+    printf("  register <peer_id>         Re-register with signaling server\n");
     printf("  disconnect <peer_id>       Disconnect from peer\n");
+    printf("  disconnect_all             Disconnect all peers\n");
     printf("  help                       Show this help\n");
     printf("  quit                       Exit\n\n");
     set_color(Color::Reset);
@@ -916,6 +924,29 @@ int main(int argc, char* argv[]) {
             }
             print_stats(arg1.c_str());
         }
+        // ---- peers ----
+        else if (cmd == "peers") {
+            uint32_t count = 0;
+            char buf[4096] = {};
+            err = p2p_get_peers(g_handle, buf, sizeof(buf), &count);
+            if (err != P2pErrorCode::Ok) {
+                log_err("p2p_get_peers failed: %s", p2p_error_string(err));
+            } else if (count == 0) {
+                log_info("No connected peers.");
+            } else {
+                log_info("Connected peers (%u):", count);
+                // Split by '\n' and print
+                std::string s(buf);
+                size_t pos = 0;
+                while (pos < s.size()) {
+                    size_t nl = s.find('\n', pos);
+                    if (nl == std::string::npos) nl = s.size();
+                    printf("  - %s\n", s.substr(pos, nl - pos).c_str());
+                    pos = nl + 1;
+                }
+                fflush(stdout);
+            }
+        }
         // ---- fec ----
         // 注意：FEC/加密/DNS伪装 只需在一端启用，对端会自动协商适配。
         //       请勿两端同时调用，否则双方同时发起协商会导致冲突错误。
@@ -1017,6 +1048,44 @@ int main(int argc, char* argv[]) {
                 log_err("p2p_disconnect failed: %s", p2p_error_string(err));
             else
                 log_ok("Disconnected from [%s]", arg1.c_str());
+        }
+        // ---- disconnect_all ----
+        else if (cmd == "disconnect_all" || cmd == "dca") {
+            err = p2p_disconnect_all(g_handle);
+            if (err != P2pErrorCode::Ok)
+                log_err("p2p_disconnect_all failed: %s", p2p_error_string(err));
+            else {
+                {
+                    std::lock_guard<std::mutex> lk(g_conn_mutex);
+                    g_conn_states.clear();
+                }
+                log_ok("All peers disconnected.");
+            }
+        }
+        // ---- unregister ----
+        else if (cmd == "unregister" || cmd == "unreg") {
+            err = p2p_unregister(g_handle);
+            if (err != P2pErrorCode::Ok)
+                log_err("p2p_unregister failed: %s", p2p_error_string(err));
+            else {
+                {
+                    std::lock_guard<std::mutex> lk(g_conn_mutex);
+                    g_conn_states.clear();
+                }
+                log_ok("Unregistered from signaling. Use 'register <peer_id>' to reconnect.");
+            }
+        }
+        // ---- register (re-register after unregister) ----
+        else if (cmd == "register" || cmd == "reg") {
+            std::string new_id = arg1.empty() ? g_my_peer_id : arg1;
+            log_info("Registering as \"%s\" ...", new_id.c_str());
+            err = p2p_register(g_handle, new_id.c_str());
+            if (err != P2pErrorCode::Ok)
+                log_err("p2p_register failed: %s", p2p_error_string(err));
+            else {
+                g_my_peer_id = new_id;
+                log_ok("Registered as \"%s\".", new_id.c_str());
+            }
         }
         else {
             log_warn("Unknown command: \"%s\". Type 'help' for usage.", cmd.c_str());
