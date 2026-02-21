@@ -220,28 +220,6 @@ Full documentation: [docs/API.md](docs/API.md)
 
 ---
 
-## Platform Support / 平台支持
-
-| Platform | Target | Artifact |
-|----------|--------|----------|
-| Windows x86 | `i686-pc-windows-msvc` | `p2p.dll` / `p2p.lib` |
-| Windows x64 | `x86_64-pc-windows-msvc` | `p2p.dll` / `p2p.lib` |
-| Windows ARM64 | `aarch64-pc-windows-msvc` | `p2p.dll` / `p2p.lib` |
-| Linux x86_64 | `x86_64-unknown-linux-gnu` | `libp2p.so` / `libp2p.a` |
-| Linux ARM64 | `aarch64-unknown-linux-gnu` | `libp2p.so` / `libp2p.a` |
-| Android ARM64 | `aarch64-linux-android` | `libp2p.so` / `libp2p.a` |
-| Android x86 | `i686-linux-android` | `libp2p.so` / `libp2p.a` |
-| iOS ARM64 (Device) | `aarch64-apple-ios` | `libp2p.a` |
-| iOS ARM64 (Simulator) | `aarch64-apple-ios-sim` | `libp2p.a` |
-| macOS ARM64 | `aarch64-apple-darwin` | `libp2p.dylib` / `libp2p.a` |
-| macOS x86_64 | `x86_64-apple-darwin` | `libp2p.dylib` / `libp2p.a` |
-| macOS Universal | ARM64 + x86_64 (lipo) | `libp2p.dylib` / `libp2p.a` |
-| iOS XCFramework | Device + Simulator | `libp2p.xcframework` |
-
-Builds 4 targets + Universal Binary (lipo) + iOS XCFramework.
-Requires: Xcode 14+.
-
-
 ### Manual Cross-compilation / 手动交叉编译
 
 ```bash
