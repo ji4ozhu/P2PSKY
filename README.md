@@ -6,14 +6,23 @@
 Rust core with C ABI exports. Works with C/C++/C#/Python/Java/Swift.
 
 
-Dmeo:
-A User: p2p_demo.exe user1
-B User: p2p_demo.exe user2
+## Windows Demo  p2p_demo.exe [examples\p2p_demo.cpp]
 
-A User:connect user2
-A User:send user2 hello    [send text]
-A User:file user2 d:\software\xxx.zip    [send file]
+| Feature | Description |
+|---------|-------------|
+| **A PC Register** |p2p_demo.exe user1 |
+| **B PC Register** |p2p_demo.exe user2 |
+| **P2P Connect** |connect user2 |
+| **send text** | send user2 hello~ |
+| **send file** | file user2 d:\software\test.zip |
+| **stats user2** | Show connection statistics |
+| **list** | Show all connections and states |
+| **fec user2 on** | Toggle FEC (only one side needed) |
+| **encrypt user2 on** | Toggle encryption (only one side needed) |
+**p2p_demo.cpp more...**
+
 ---
+
 
 ## Features / 核心功能
 
@@ -108,11 +117,26 @@ cargo build --release -p p2p-ffi
 
 Build artifacts in `target/release/`:
 
-| Platform | Files |
-|----------|-------|
-| Windows | `p2p.dll` + `p2p.dll.lib` (dynamic) / `p2p.lib` (static) |
-| macOS | `libp2p.dylib` / `libp2p.a` |
-| Linux | `libp2p.so` / `libp2p.a` |
+release/
+├── p2p.h                              C header (cbindgen)
+├── Windows/
+│   ├── x86/        p2p.dll + p2p.lib
+│   ├── x64/        p2p.dll + p2p.lib
+│   └── aarch64/    p2p.dll + p2p.lib
+├── Linux/
+│   ├── x86_64/     libp2p.so + libp2p.a
+│   └── aarch64/    libp2p.so + libp2p.a
+├── Android/
+│   ├── aarch64/    libp2p.so + libp2p.a
+│   └── x86/        libp2p.so + libp2p.a
+├── iOS/
+│   ├── aarch64/         libp2p.a  (Device)
+│   ├── aarch64-sim/     libp2p.a  (Simulator)
+│   └── universal/       libp2p.xcframework  (Device + Simulator)
+└── macOS/
+    ├── aarch64/         libp2p.dylib + libp2p.a  (Apple Silicon)
+    ├── x86_64/          libp2p.dylib + libp2p.a  (Intel)
+    └── universal/       libp2p.dylib + libp2p.a  (Universal Binary)|
 
 C header auto-generated at `crates/p2p-ffi/include/p2p.h`.
 
@@ -217,29 +241,9 @@ Full documentation: [docs/API.md](docs/API.md)
 | macOS Universal | ARM64 + x86_64 (lipo) | `libp2p.dylib` / `libp2p.a` |
 | iOS XCFramework | Device + Simulator | `libp2p.xcframework` |
 
-### One-click Build / 一键编译
-
-**Windows / Linux / Android** (run on Windows):
-
-```bat
-scripts\build_all.bat
-```
-
-Builds 7 targets: Windows x86/x64/ARM64, Linux x86_64/ARM64, Android ARM64/x86.
-Requires: Visual Studio 2022, cargo-zigbuild + Zig, Android NDK.
-
-**iOS / macOS** (run on Mac):
-
-```bash
-./scripts/build_apple.sh           # All (iOS + macOS + Universal)
-./scripts/build_apple.sh ios       # iOS only
-./scripts/build_apple.sh macos     # macOS only
-```
-
 Builds 4 targets + Universal Binary (lipo) + iOS XCFramework.
 Requires: Xcode 14+.
 
-All artifacts output to `release/` directory. See [scripts/BUILD_ENV.md](scripts/BUILD_ENV.md) for full environment setup.
 
 ### Manual Cross-compilation / 手动交叉编译
 
@@ -374,28 +378,6 @@ scripts\build_all.bat
 
 Release directory structure / 产物目录:
 
-```
-release/
-├── p2p.h                              C header (cbindgen)
-├── Windows/
-│   ├── x86/        p2p.dll + p2p.lib
-│   ├── x64/        p2p.dll + p2p.lib
-│   └── aarch64/    p2p.dll + p2p.lib
-├── Linux/
-│   ├── x86_64/     libp2p.so + libp2p.a
-│   └── aarch64/    libp2p.so + libp2p.a
-├── Android/
-│   ├── aarch64/    libp2p.so + libp2p.a
-│   └── x86/        libp2p.so + libp2p.a
-├── iOS/
-│   ├── aarch64/         libp2p.a  (Device)
-│   ├── aarch64-sim/     libp2p.a  (Simulator)
-│   └── universal/       libp2p.xcframework  (Device + Simulator)
-└── macOS/
-    ├── aarch64/         libp2p.dylib + libp2p.a  (Apple Silicon)
-    ├── x86_64/          libp2p.dylib + libp2p.a  (Intel)
-    └── universal/       libp2p.dylib + libp2p.a  (Universal Binary)
-```
 
 ### Windows Demo
 
